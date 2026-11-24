@@ -29,54 +29,6 @@ from issue_gov.settings import Config
 
 LOG = logging.getLogger("issue-gov-webhook")
 
-@contextmanager
-def connect(config: Config) -> Iterator[sqlite3.Connection]:
-    """创建一次数据库会话，退出时提交或回滚事务，并关闭连接。
-
-    Args:
-        config: 包含 SQLite 文件路径的服务配置。
-    Yields:
-        使用 sqlite3.Row 返回查询结果的连接，可按列名访问记录。
-    Returns:
-        供 with 语句使用的数据库连接上下文管理器；进入时提供下述连接，退出时关闭连接。
-    """
-    if config.database_url:
-        from common.pgstore import connect as pg_connect
-        with pg_connect(config.database_url) as db:
-            yield db
-        return
-    db = sqlite3.connect(config.database, timeout=10)
-    db.row_factory = sqlite3.Row
-    try:
-        with db:
-            yield db
-    finally:
-        db.close()
-
-
-def initialize(config: Config) -> None:
-    """准备 Webhook 数据库：创建目录、表和索引，并将每个 Issue 被更新请求替代的旧任务标为已覆盖。可以重复调用，让各个入口在使用数据库前确认它已经准备好。
-
-    Args:
-        config: 包含 SQLite 文件路径的服务配置。
-    Returns:
-        None；标记被后续请求覆盖的旧任务，保留全部历史记录；重复初始化不重新处理已覆盖记录。
-    """
-
-    if config.database_url:
-        from common.pgstore import initialize as pg_initialize
-        pg_initialize(config.database_url)
-        return
-
-    # 创建数据库所在目录
-    Path(config.database).parent.mkdir(parents=True, exist_ok=True)
-
-    # 连接数据库并创建表和索引
-    with connect(config) as db:
-        db.execute("BEGIN IMMEDIATE")
-        apply_sqlite(db)
-
-
 
 def select_issue(
     payload: dict[str, Any], repositories: tuple[str, ...],
