@@ -1,0 +1,172 @@
+"""PostgreSQL 存储：服务化部署中的独立数据库。SQLite 路径仍由 receiver 保持原样。"""
+
+from contextlib import contextmanager
+from typing import Iterator
+
+# 固定锁编号，避免多个接收进程同时建表。
+SCHEMA_LOCK = 8675309
+
+
+class DatabaseError(Exception):
+    """数据库不可用或写入失败。调用方据此返回 503，不把连接串写入日志。"""
+
+
+class Row(dict):
+    """同时支持列名和下标，兼容现有 sqlite3.Row 用法。"""
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return dict.__getitem__(self, key)
+
+
+class Result:
+    """模拟 sqlite 游标上实际用到的 fetchone、rowcount 和 lastrowid。"""
+
+    def __init__(self, rows: list[Row], rowcount: int, lastrowid: int | None = None) -> None:
+        self._rows = rows
+        self._index = 0
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self) -> Row | None:
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return row
+
+    def fetchall(self) -> list[Row]:
+        rows = self._rows[self._index:]
+        self._index = len(self._rows)
+        return rows
+
+
+def _placeholders(sql: str) -> str:
+    """把 SQLite 占位符换成 psycopg 占位符，不改写字符串字面量。"""
+    output: list[str] = []
+    quoted = False
+    for char in sql:
+        if char == "'":
+            quoted = not quoted
+            output.append(char)
+        elif char == "?" and not quoted:
+            output.append("%s")
+        else:
+            output.append(char)
+    return "".join(output)
+
+
+class PgConnection:
+    """在 PostgreSQL 上执行与 SQLite 相同的语句。"""
+
+    def __init__(self, connection) -> None:
+        self._connection = connection
+
+    def execute(self, sql: str, params: tuple | list = ()) -> Result:
+        statement = sql.strip()
+        if statement.upper().startswith("BEGIN"):
+            return Result([], 0)
+        translated = _placeholders(sql)
+        returning = False
+        if "INTO maintainer_suggestions" in translated and "RETURNING" not in translated.upper():
+            translated = translated.rstrip().rstrip(";") + " RETURNING id"
+            returning = True
+        try:
+            cursor = self._connection.execute(translated, params)
+        except Exception as exc:
+            if type(exc).__module__.startswith("psycopg"):
+                raise DatabaseError("数据库写入失败") from None
+            raise
+        lastrowid = None
+        rows: list[Row] = []
+        if returning:
+            fetched = cursor.fetchone()
+            if fetched:
+                lastrowid = fetched["id"] if isinstance(fetched, dict) else fetched[0]
+        elif cursor.description:
+            rows = [Row(row) for row in cursor.fetchall()]
+        return Result(rows, cursor.rowcount, lastrowid)
+
+
+@contextmanager
+def connect(database_url: str) -> Iterator[PgConnection]:
+    """打开一次 PostgreSQL 事务，退出时提交或回滚。"""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    try:
+        raw = psycopg.connect(database_url, row_factory=dict_row, connect_timeout=5)
+    except psycopg.Error:
+        raise DatabaseError("数据库不可用") from None
+    wrapper = PgConnection(raw)
+    try:
+        yield wrapper
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        raw.close()
+
+
+def initialize(database_url: str) -> None:
+    """创建服务化部署使用的表和索引。可以重复调用。"""
+    import psycopg
+
+    try:
+        raw = psycopg.connect(database_url, connect_timeout=5, autocommit=True)
+    except psycopg.Error:
+        raise DatabaseError("数据库不可用") from None
+    try:
+        raw.execute("SELECT pg_advisory_lock(%s)", (SCHEMA_LOCK,))
+        try:
+            _schema(raw)
+        finally:
+            raw.execute("SELECT pg_advisory_unlock(%s)", (SCHEMA_LOCK,))
+    except psycopg.Error:
+        raise DatabaseError("数据库结构初始化失败") from None
+    finally:
+        raw.close()
+
+
+def _schema(connection) -> None:
+    """写入当前版本的表结构。语句集中在 govcommon.schema。"""
+    from govcommon.schema import apply_postgres
+    apply_postgres(connection)
+
+
+def claim_due(database_url: str, now: float, *, stale_after: float = 60, limit: int = 20) -> list[dict]:
+    """回收超时未领取的任务，并把到期重试任务标记为已投递。
+
+    Args:
+        database_url: PostgreSQL 连接串。
+        now: 当前 Unix 时间戳。
+        stale_after: 停留在 dispatching 超过该秒数后重新入队。
+        limit: 单次最多领取的任务数。
+    Returns:
+        已标记为 dispatching、需要重新投递到队列的任务。
+    """
+    import psycopg
+    from psycopg.rows import dict_row
+
+    stale = """UPDATE events SET state = 'queued', next_attempt = 0
+               WHERE state = 'dispatching' AND updated_at <= %s"""
+    claim = """WITH due AS (
+                   SELECT event_id FROM events
+                   WHERE state = 'queued' AND next_attempt <= %s
+                   ORDER BY updated_at
+                   FOR UPDATE SKIP LOCKED
+                   LIMIT %s
+               )
+               UPDATE events SET state = 'dispatching', updated_at = %s
+               FROM due WHERE events.event_id = due.event_id
+               RETURNING events.event_id, events.repository, events.issue_number, events.checks"""
+    try:
+        with psycopg.connect(database_url, row_factory=dict_row, connect_timeout=5) as raw:
+            with raw.transaction():
+                raw.execute(stale, (now - stale_after,))
+                rows = raw.execute(claim, (now, limit, now)).fetchall()
+    except psycopg.Error:
+        raise DatabaseError("数据库不可用") from None
+    return [dict(row) for row in rows]

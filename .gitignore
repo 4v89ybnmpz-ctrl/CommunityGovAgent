@@ -1,8 +1,10 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv*/
 .env
 *.sqlite3
 *.sqlite3-*
-webhook/runtime/
+issue-gov-agent/runtime/
+issue-gov-agent/repository.yml
 *.sqlite3.worker.lock

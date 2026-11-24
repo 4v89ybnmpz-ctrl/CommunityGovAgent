@@ -1,0 +1,391 @@
+"""AtomGit Issue Webhook 接收入口及共用的配置、数据库函数。
+
+主机上的日常操作仍使用 manage.py，由 Supervisor 加载 create_app()。
+容器入口是本文件的 main()，直接启动 Gunicorn，不经过 Supervisor。
+配置了 SERVICE_MODE=queue 时，校验通过的任务写入 PostgreSQL 并投递到消息队列。
+"""
+
+from contextlib import contextmanager
+import hashlib
+import hmac
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import sqlite3
+import time
+from typing import Any, Iterator
+
+from flask import Flask, Response, jsonify, request
+from dotenv import dotenv_values
+
+from govcommon.pgstore import DatabaseError
+from govcommon.queueing import QueuePublishError, publish_analysis_task
+from govcommon.schema import apply_sqlite
+import issue_gov.paths as paths
+from issue_gov.checks.base import default_checks, dump_checks
+from issue_gov.queues import ISSUE_ANALYSIS
+from issue_gov.settings import Config
+
+
+LOG = logging.getLogger("issue-gov-webhook")
+
+@contextmanager
+def connect(config: Config) -> Iterator[sqlite3.Connection]:
+    """创建一次数据库会话，退出时提交或回滚事务，并关闭连接。
+
+    Args:
+        config: 包含 SQLite 文件路径的服务配置。
+    Yields:
+        使用 sqlite3.Row 返回查询结果的连接，可按列名访问记录。
+    Returns:
+        供 with 语句使用的数据库连接上下文管理器；进入时提供下述连接，退出时关闭连接。
+    """
+    if config.database_url:
+        from govcommon.pgstore import connect as pg_connect
+        with pg_connect(config.database_url) as db:
+            yield db
+        return
+    db = sqlite3.connect(config.database, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
+
+
+def initialize(config: Config) -> None:
+    """准备 Webhook 数据库：创建目录、表和索引，并将每个 Issue 被更新请求替代的旧任务标为已覆盖。可以重复调用，让各个入口在使用数据库前确认它已经准备好。
+
+    Args:
+        config: 包含 SQLite 文件路径的服务配置。
+    Returns:
+        None；标记被后续请求覆盖的旧任务，保留全部历史记录；重复初始化不重新处理已覆盖记录。
+    """
+
+    if config.database_url:
+        from govcommon.pgstore import initialize as pg_initialize
+        pg_initialize(config.database_url)
+        return
+
+    # 创建数据库所在目录
+    Path(config.database).parent.mkdir(parents=True, exist_ok=True)
+
+    # 连接数据库并创建表和索引
+    with connect(config) as db:
+        db.execute("BEGIN IMMEDIATE")
+        apply_sqlite(db)
+
+
+
+def select_issue(
+    payload: dict[str, Any], repositories: tuple[str, ...],
+) -> tuple[str, int] | None:
+    """筛选目标仓库未关闭 Issue 的创建及标题、正文更新事件。
+
+    Args:
+        payload: AtomGit Webhook 的 JSON 请求体。
+        repositories: 允许接入的仓库路径列表。
+    Returns:
+        来源仓库和仓库内 Issue 编号；无关事件或明确已关闭时返回 None。
+        未提供状态时允许入队，由后台读取最新状态确认。
+        目标 Issue 事件缺少必要字段或编号不合法时抛出 ValueError。
+    """
+
+    # 检查是否为 Issue 事件
+    if payload.get("object_kind", payload.get("event_type")) != "issue":
+        return None
+
+    # 读取仓库信息和 Issue 信息
+    project = payload.get("project")
+    attrs = payload.get("object_attributes")
+    if not isinstance(project, dict) or not isinstance(attrs, dict):
+        raise ValueError("missing project/object_attributes")
+
+    # 检查仓库是否接入
+    repository = project.get("path_with_namespace")
+    if not isinstance(repository, str) or repository not in repositories:
+        return None
+    
+    # 检查事件类型和实际内容变化（只处理新建和更新）
+    action = attrs.get("action")
+    if action not in ("open", "update"):
+        return None
+    # 已关闭 Issue 的内容编辑不再入队；缺少状态时交给后台查询确认。
+    if attrs.get("state") == "closed":
+        return None
+    
+    # 检查更新事件是否实际修改了标题、描述或正文
+    changes = payload.get("changes")
+    if action == "update" and isinstance(changes, dict):
+        content_changes = [changes[k] for k in ("title", "description", "body") if k in changes]
+        if not content_changes:
+            return None
+        if all(isinstance(c, dict) and "previous" in c and "current" in c
+               and c["previous"] == c["current"] for c in content_changes):
+            return None
+
+    # 检查Issue编号
+    number = attrs.get("iid")
+    if isinstance(number, bool) or not re.fullmatch(r"[1-9][0-9]*", str(number)):
+        raise ValueError("invalid issue iid")
+    number = int(number)
+    if number > 2**63 - 1:
+        raise ValueError("issue iid too large")
+    
+    return repository, number
+
+
+def create_app(config: Config | None = None) -> Flask:
+    """创建 Webhook HTTP 应用，只负责认证、筛选和入队，不在 HTTP 请求中执行治理检查。
+
+    Args:
+        config: 显式服务配置；为 None 时从服务根目录的 .env 读取。
+    Returns:
+        可由 Gunicorn 加载的 Flask 应用，包含健康检查和 Webhook 两个入口。
+    """
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # 读取配置并创建数据库、表和索引
+    config = config or Config.from_file()
+    initialize(config)
+
+    # 创建应用，限制请求体大小为 1MB
+    app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+
+    @app.get("/health")
+    def health() -> Response:
+        """返回接收进程的存活状态。
+
+        Args:
+            无；由 Flask 在收到 GET /health 请求时调用。
+        Returns:
+            包含 {"status": "ok"} 的 JSON 响应，仅表示接收进程存活。
+        """
+        return jsonify(status="ok")
+
+    @app.get("/ready")
+    def ready() -> tuple[Response, int]:
+        """确认数据库可读写；服务模式下同时确认消息队列可连接。"""
+        try:
+            with connect(config) as db:
+                db.execute("SELECT 1")
+            if config.rabbitmq_url:
+                from govcommon.queueing import check
+                check(config.rabbitmq_url, ISSUE_ANALYSIS)
+        except (sqlite3.Error, DatabaseError, QueuePublishError):
+            return jsonify(status="unavailable"), 503
+        return jsonify(status="ok"), 200
+
+    @app.post("/webhook")
+    def webhook() -> tuple[Response, int]:
+        """校验 AtomGit WebHook 密码，将需要检查的 Issue 事件持久化入队。
+
+        Args:
+            无显式参数；请求头和 JSON 请求体从 Flask 当前请求中读取。
+        Returns:
+            JSON 响应及 HTTP 状态码：新事件入队为 202，重复或忽略为 200；
+            认证失败为 401，负载不合法为 400，队列写入失败为 503。
+            请求体超过应用大小限制时，由 Flask 返回 413。
+        """
+
+        # 验证请求密码
+        supplied = request.headers.get("X-GitCode-Token", "")
+        if not hmac.compare_digest(supplied.encode(), config.secret.encode()):
+            return jsonify(error="unauthorized"), 401
+
+        # 读取请求中的 JSON 数据（AtomGit 发来的事件内容）
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="expected JSON object"), 400
+        
+        # 筛选需要处理的 Issue
+        try:
+            selected = select_issue(payload, config.repositories)
+        except ValueError:
+            return jsonify(error="invalid Issue event"), 400
+        if selected is None:
+            return jsonify(status="ignored"), 200
+        repository, number = selected # owner/repo, number
+
+        # 确定事件身份，生成唯一标识，用于去重
+        identity = (payload.get("uuid") or payload.get("produce_random_id")
+                    or request.headers.get("X-GitCode-Delivery"))
+        if identity is not None and not isinstance(identity, str):
+            return jsonify(error="invalid event identifier"), 400
+        if not identity:
+            identity = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        event_id = hashlib.sha256((repository + ":" + identity).encode()).hexdigest()
+
+        # 将任务保存到数据库。服务模式下先记为 dispatching，避免重试投递线程重复发布。
+        added = False
+        stored_state = ""
+        try:
+            with connect(config) as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT state, checks FROM events WHERE event_id = ?", (event_id,)).fetchone()
+                added = row is None
+                stored_state = "" if row is None else row["state"]
+                checks = default_checks() if row is None or not row["checks"] else json.loads(row["checks"])
+                if added:
+                    previous = db.execute("""SELECT attempts, next_attempt FROM events
+                                             WHERE repository = ? AND issue_number = ?
+                                               AND state IN ('queued', 'dispatching')""",
+                                          (repository, number)).fetchone()
+                    # 保留旧请求的编号、结果和错误，仅结束其调度；新通知另存一条记录。
+                    db.execute("""UPDATE events SET state='superseded'
+                                  WHERE repository = ? AND issue_number = ?
+                                    AND state IN ('queued', 'running', 'failed', 'dispatching')""",
+                               (repository, number))
+                    initial_state = "dispatching" if config.rabbitmq_url else "queued"
+                    db.execute("""INSERT INTO events(event_id, repository, issue_number, updated_at,
+                                                    attempts, next_attempt, state, checks)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                               (event_id, repository, number, time.time(),
+                                previous["attempts"] if previous else 0,
+                                previous["next_attempt"] if previous else 0, initial_state,
+                                dump_checks(default_checks())))
+        except (sqlite3.Error, DatabaseError):
+            LOG.error("通知保存失败：仓库=%s，Issue=#%s，数据库写入失败，请检查磁盘空间和目录权限",
+                      repository, number)
+            return jsonify(error="queue unavailable"), 503
+
+        # 新任务，或上次投递失败后仍停在 queued 的重复通知，才发布到队列。
+        # 已经是 dispatching 的重复通知不重复发布，由消费者或超时回收处理。
+        if config.rabbitmq_url and (added or stored_state == "queued"):
+            try:
+                publish_analysis_task(config.rabbitmq_url, event_id, repository, number, checks, ISSUE_ANALYSIS)
+            except QueuePublishError:
+                if added:
+                    _release_dispatch(config, event_id)
+                LOG.error("通知已保存但未能投递到消息队列：仓库=%s，Issue=#%s，事件=%s",
+                          repository, number, event_id[:12])
+                return jsonify(error="queue unavailable"), 503
+            if not added:
+                _mark_dispatching(config, event_id)
+
+        LOG.info("%s：仓库=%s，Issue=#%s，事件=%s",
+                 "收到通知，已加入队列" if added else "收到重复通知，已去重，不再新增任务",
+                 repository, number, event_id[:12])
+
+        # 返回处理结果：202 表示新事件入队，200 表示重复或忽略
+        return jsonify(status="queued" if added else "duplicate",
+                       state="queued" if added else stored_state), 202 if added else 200
+
+    return app
+
+
+def _release_dispatch(config: Config, event_id: str) -> None:
+    """投递失败时把刚入库的任务退回 queued，等待通知方或重试线程再次投递。"""
+    try:
+        with connect(config) as db:
+            db.execute("UPDATE events SET state='queued' WHERE event_id=? AND state='dispatching'", (event_id,))
+    except (sqlite3.Error, DatabaseError):
+        LOG.error("任务未能退回等待投递：事件=%s", event_id[:12])
+
+
+def _mark_dispatching(config: Config, event_id: str) -> None:
+    """重复通知补投成功后标记为已投递，避免重试线程再发一条。"""
+    try:
+        with connect(config) as db:
+            db.execute("UPDATE events SET state='dispatching' WHERE event_id=? AND state='queued'", (event_id,))
+    except (sqlite3.Error, DatabaseError):
+        LOG.error("任务已投递但状态更新失败：事件=%s", event_id[:12])
+
+
+def queue_snapshot(config: Config) -> dict[str, Any]:
+    """只读查询各仓库的任务统计和最近五条任务，不创建或修改数据库。
+
+    Args:
+        config: 包含任务数据库路径的服务配置。
+    Returns:
+        database 为绝对路径，exists 表示文件存在；counts 为按仓库及状态分组的
+        数量，recent 为最近五条任务。文件尚不存在时两个列表为空。
+        服务模式改为查询 PostgreSQL，database 为去掉密码的连接串。
+    """
+    if config.database_url:
+        from govcommon.queueing import redact_url
+        snapshot = {"database": redact_url(config.database_url), "exists": True,
+                    "counts": [], "recent": []}
+        try:
+            with connect(config) as db:
+                snapshot["counts"] = [dict(row) for row in db.execute(
+                    "SELECT repository, state, COUNT(*) AS count FROM events "
+                    "GROUP BY repository, state ORDER BY repository, state").fetchall()]
+                snapshot["recent"] = [dict(row) for row in db.execute(
+                    "SELECT repository, issue_number, state, attempts, updated_at, last_error, result "
+                    "FROM events ORDER BY updated_at DESC, event_id LIMIT 5").fetchall()]
+        except DatabaseError:
+            snapshot["exists"] = False
+        return snapshot
+    path = Path(config.database).resolve()
+    snapshot: dict[str, Any] = {"database": str(path), "exists": path.is_file(),
+                                "counts": [], "recent": []}
+    if not snapshot["exists"]:
+        return snapshot
+    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        with db:
+            db.execute("BEGIN")
+            snapshot["counts"] = [dict(row) for row in db.execute(
+                "SELECT repository, state, COUNT(*) AS count FROM events "
+                "GROUP BY repository, state ORDER BY repository, state")]
+            snapshot["recent"] = [dict(row) for row in db.execute(
+                "SELECT repository, issue_number, state, attempts, updated_at, last_error, result "
+                "FROM events ORDER BY updated_at DESC, event_id LIMIT 5")]
+    finally:
+        db.close()
+    return snapshot
+
+
+def listen_port() -> int:
+    """读取容器或进程环境中的端口，未设置时再读服务根目录的 .env，最后默认 7000。"""
+    port = os.environ.get("WEBHOOK_PORT", "").strip()
+    if not port:
+        path = paths.env_file()
+        if path.is_file():
+            port = (dotenv_values(path, interpolate=False).get("WEBHOOK_PORT") or "").strip()
+    port = port or "7000"
+    if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError("WEBHOOK_PORT 必须是 1 到 65535 之间的整数。")
+    return int(port)
+
+
+def main() -> None:
+    """容器和直接启动入口：用 Gunicorn 加载接收应用，不经过 Supervisor。"""
+    from gunicorn.app.base import BaseApplication
+
+    os.umask(0o077)
+    port = listen_port()
+    workers = os.environ.get("WEB_CONCURRENCY", "2").strip() or "2"
+    if not workers.isascii() or not workers.isdecimal() or not 1 <= int(workers) <= 32:
+        raise ValueError("WEB_CONCURRENCY 必须是 1 到 32 之间的整数。")
+
+    class ReceiverApplication(BaseApplication):
+        def __init__(self) -> None:
+            self.options = {
+                "bind": f"0.0.0.0:{port}",
+                "workers": int(workers),
+                "timeout": 30,
+                "errorlog": "-",
+                "graceful_timeout": 20,
+            }
+            super().__init__()
+
+        def load_config(self) -> None:
+            for key, value in self.options.items():
+                self.cfg.set(key.lower(), value)
+
+        def load(self):
+            return create_app()
+
+    ReceiverApplication().run()
+
+
+if __name__ == "__main__":
+    main()

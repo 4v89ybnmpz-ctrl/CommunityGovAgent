@@ -1,0 +1,6 @@
+# 列出的仓库接入服务；无需维护者时填 []，未列出的仓库不接入；修改后 restart 生效。
+# 示例：
+# owner/repo:
+#   - maintainer1
+#   - maintainer2
+# owner/another-repo: []

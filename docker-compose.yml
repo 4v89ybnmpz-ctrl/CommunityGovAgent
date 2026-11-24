@@ -1,0 +1,103 @@
+# 接收服务、消费者、PostgreSQL 和 RabbitMQ。
+# 唯一的环境文件是 issue-gov-agent/.env。请用 scripts/compose 启动，它会把该文件传给 Compose。
+# 容器进程只额外设置 SERVICE_MODE=queue；服务用这份文件里的账号和口令拼出连接串。
+# 消费者数量：scripts/compose up -d --scale consumer=3
+
+name: issue-gov
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?请在 issue-gov-agent/.env 中设置 POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 issue-gov-agent/.env 中设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?请在 issue-gov-agent/.env 中设置 POSTGRES_DB}
+    volumes:
+      - issue_gov_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "${POSTGRES_PORT:-54329}:5432"
+    mem_limit: 512m
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?请在 issue-gov-agent/.env 中设置 RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?请在 issue-gov-agent/.env 中设置 RABBITMQ_PASSWORD}
+    volumes:
+      - issue_gov_rabbitmq:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    ports:
+      - "${RABBITMQ_PORT:-56729}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    mem_limit: 512m
+    restart: unless-stopped
+
+  receiver:
+    build:
+      context: .
+      dockerfile: issue-gov-agent/Dockerfile
+      target: receiver
+    init: true
+    environment:
+      SERVICE_MODE: queue
+      WEBHOOK_PORT: "7000"
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+    volumes:
+      - ./issue-gov-agent/.env:/app/.env:ro
+      - ./issue-gov-agent/repository.yml:/app/repository.yml:ro
+    ports:
+      - "${WEBHOOK_PORT:-7000}:7000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7000/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    mem_limit: 256m
+    restart: unless-stopped
+
+  consumer:
+    build:
+      context: .
+      dockerfile: issue-gov-agent/Dockerfile
+      target: consumer
+    init: true
+    environment:
+      SERVICE_MODE: queue
+      CONSUMER_HEALTH_PORT: "7001"
+    volumes:
+      - ./issue-gov-agent/.env:/app/.env:ro
+      - ./issue-gov-agent/repository.yml:/app/repository.yml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7001/', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 40s
+    mem_limit: 768m
+    restart: unless-stopped
+
+volumes:
+  issue_gov_postgres:
+  issue_gov_rabbitmq:

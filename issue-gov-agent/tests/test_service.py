@@ -1,0 +1,287 @@
+"""服务化队列、多密钥轮换和竞争消费测试。不访问真实平台、数据库或消息代理。"""
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+import issue_gov.analysis as analysis
+import issue_gov.checks.compliance.implementation as compliance
+import issue_gov.checks.tools.compliance.run as compliance_tool
+import issue_gov.receiver as receiver
+import issue_gov.worker as worker
+from govcommon.errors import IssueProcessingError
+
+RESULT = {"status": "pass", "comment_action": "suppressed"}
+
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "repository.yml").write_text("example/project: []\n", encoding="utf-8")
+        patched = patch("issue_gov.paths.service_root", return_value=root)
+        patched.start()
+        self.addCleanup(patched.stop)
+        self.root = root
+        self.base = {
+            "WEBHOOK_SECRET": "secret", "ATOMGIT_TOKEN": "token",
+            "AGENT_API_KEY": "single-key", "LLM_BASE_URL": "https://models.example",
+            "LLM_MODEL": "model",
+        }
+
+    def test_single_key_keeps_task_retry_and_ignores_service_urls(self):
+        env = {**self.base, "DATABASE_URL": "postgresql://user:secret@db/app",
+               "RABBITMQ_URL": "amqp://user:secret@mq/%2F", "AGENT_API_KEYS": ""}
+        config = receiver.Config.from_env(env)
+        self.assertEqual(config.agent_api_keys, ("single-key",))
+        self.assertFalse(config.llm_failover)
+        self.assertEqual(config.database_url, "")
+        self.assertEqual(config.rabbitmq_url, "")
+        self.assertNotIn("secret", repr(config))
+        self.assertNotIn("single-key", repr(config))
+
+    def test_multiple_keys_and_service_mode_are_explicit(self):
+        env = {**self.base, "AGENT_API_KEYS": " key-a, key-b, key-a ",
+               "SERVICE_MODE": "queue",
+               "DATABASE_URL": "postgresql://user:secret@db/app",
+               "RABBITMQ_URL": "amqp://user:secret@mq/%2F",
+               "LLM_KEY_RETRIES": "2", "LLM_KEY_RETRY_INTERVAL": "10"}
+        config = receiver.Config.from_env(env)
+        self.assertEqual(config.agent_api_keys, ("key-a", "key-b"))
+        self.assertEqual(config.agent_api_key, "key-a")
+        self.assertTrue(config.llm_failover)
+        self.assertEqual(config.llm_key_retries, 2)
+        self.assertEqual(config.llm_key_retry_interval, 10)
+        self.assertNotIn("key-a", repr(config))
+        self.assertNotIn("secret", repr(config))
+        env["DATABASE_URL"] = ""
+        env["RABBITMQ_URL"] = ""
+        with self.assertRaisesRegex(ValueError, "POSTGRES_USER"):
+            receiver.Config.from_env(env)
+
+    def test_service_urls_are_built_from_passwords(self):
+        env = {**self.base, "SERVICE_MODE": "queue",
+               "POSTGRES_USER": "issue", "POSTGRES_PASSWORD": "dbpass", "POSTGRES_DB": "issue_gov",
+               "RABBITMQ_USER": "issue", "RABBITMQ_PASSWORD": "qpass"}
+        config = receiver.Config.from_env(env)
+        self.assertEqual(config.database_url, "postgresql://issue:dbpass@postgres:5432/issue_gov")
+        self.assertEqual(config.rabbitmq_url, "amqp://issue:qpass@rabbitmq:5672/%2F")
+        self.assertNotIn("dbpass", repr(config))
+        self.assertNotIn("qpass", repr(config))
+
+    def test_file_urls_do_not_enable_service_mode_without_process_flag(self):
+        (self.root / ".env").write_text(
+            "WEBHOOK_SECRET=secret\nATOMGIT_TOKEN=token\nAGENT_API_KEY=single-key\n"
+            "LLM_BASE_URL=https://models.example\nLLM_MODEL=model\n"
+            "DATABASE_URL=postgresql://user:secret@db/app\n"
+            "RABBITMQ_URL=amqp://user:secret@mq/%2F\n", encoding="utf-8")
+        with patch.dict(os.environ, {}, clear=True):
+            config = receiver.Config.from_file()
+        self.assertEqual(config.database_url, "")
+        with patch.dict(os.environ, {"SERVICE_MODE": "queue"}, clear=True):
+            from_file = receiver.Config.from_file()
+        self.assertEqual(from_file.database_url, "postgresql://user:secret@db/app")
+        self.assertEqual(from_file.rabbitmq_url, "amqp://user:secret@mq/%2F")
+        with patch.dict(os.environ, {"SERVICE_MODE": "queue",
+                                     "DATABASE_URL": "postgresql://user:other@postgres/app",
+                                     "RABBITMQ_URL": "amqp://user:other@rabbitmq/%2F"}, clear=True):
+            enabled = receiver.Config.from_file()
+        self.assertEqual(enabled.database_url, "postgresql://user:other@postgres/app")
+        self.assertNotIn("other", repr(enabled))
+
+
+class KeyFailoverTests(unittest.TestCase):
+    def test_each_key_retries_twice_then_switches_and_dead_letters(self):
+        calls = []
+        sleeps = []
+
+        def fail(title, body, templates, key, model, base_url):
+            calls.append(key)
+            raise IssueProcessingError("模型响应超时")
+
+        with patch.object(compliance, "recommend_template", side_effect=fail), patch.object(
+                compliance_tool.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(IssueProcessingError) as raised:
+                compliance_tool._recommend("未知", "正文", [], "ignored", "model", "https://models.example",
+                                    ("key-a", "key-b"), 2, 10)
+        self.assertTrue(raised.exception.keys_exhausted)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(calls, ["key-a", "key-a", "key-a", "key-b", "key-b", "key-b"])
+        self.assertEqual(sleeps, [10, 10, 10, 10])
+        self.assertNotIn("key-a", str(raised.exception))
+
+    def test_success_on_next_key_stops_rotation(self):
+        calls = []
+
+        def recommend(title, body, templates, key, model, base_url):
+            calls.append(key)
+            if key == "key-a":
+                raise IssueProcessingError("模型响应超时")
+            return {"status": "recommended", "template": "缺陷", "reason": "匹配", "maintainer": None}
+
+        template = {"name": "缺陷", "title": "[Bug] ", "body": [
+            {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}}]}
+        with patch.object(compliance, "parse_template", return_value=template), patch.object(
+                compliance, "check_issue", return_value={"status": "no_match", "matched_templates": [], "checks": []}), \
+                patch.object(compliance, "recommend_template", side_effect=recommend), patch.object(
+                compliance_tool.time, "sleep") as pause, patch.object(
+                compliance, "format_compliance_check", return_value="评论"):
+            result = analysis.analyze_issue(
+                "未知", "正文", [{"filename": "a.yml", "source": "s", "content": "x"}],
+                "ignored", repository="example/project", number=2,
+                agent_api_keys=("key-a", "key-b"), llm_key_retries=2, llm_key_retry_interval=10)
+        self.assertEqual(calls, ["key-a", "key-a", "key-a", "key-b"])
+        self.assertEqual(pause.call_count, 2)
+        self.assertEqual(result["summary"]["recommendation_status"], "recommended")
+
+    def test_configuration_error_does_not_sleep_or_rotate(self):
+        with patch.object(compliance, "recommend_template",
+                          side_effect=IssueProcessingError("未配置 LLM_BASE_URL 或 LLM_MODEL")) as recommend, \
+                patch.object(compliance_tool.time, "sleep") as pause:
+            with self.assertRaises(IssueProcessingError) as raised:
+                compliance_tool._recommend("未知", "正文", [], "key-a", "", "", ("key-a", "key-b"), 2, 10)
+        self.assertFalse(raised.exception.keys_exhausted)
+        self.assertEqual(recommend.call_count, 1)
+        pause.assert_not_called()
+
+
+class QueueTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "repository.yml").write_text("example/project: []\n", encoding="utf-8")
+        patched = patch("issue_gov.paths.service_root", return_value=root)
+        patched.start()
+        self.addCleanup(patched.stop)
+        self.config = receiver.Config(
+            "secret", "token", ("example/project",), str(Path(temporary.name) / "queue.db"),
+            agent_api_key="model-key", llm_base_url="https://models.example", llm_model="model",
+            rabbitmq_url="amqp://issue:issue@localhost/%2F")
+        self.app = receiver.create_app(self.config)
+        self.payload = {"object_kind": "issue", "uuid": "event-1",
+                        "project": {"path_with_namespace": "example/project"},
+                        "object_attributes": {"action": "open", "iid": 12}}
+
+    def post(self, payload=None):
+        with self.app.test_client() as client:
+            return client.post("/webhook", json=self.payload if payload is None else payload,
+                               headers={"X-GitCode-Token": "secret"})
+
+    def rows(self):
+        with receiver.connect(self.config) as db:
+            return [dict(row) for row in db.execute("SELECT * FROM events ORDER BY rowid")]
+
+    def test_publish_marks_dispatching_and_failure_releases_without_losing_task(self):
+        with patch.object(receiver, "publish_analysis_task") as publish:
+            response = self.post()
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json["state"], "queued")
+        self.assertEqual(self.rows()[0]["state"], "dispatching")
+        publish.assert_called_once()
+        payload = {**self.payload, "uuid": "event-2", "object_attributes": {"action": "open", "iid": 13}}
+        with patch.object(receiver, "publish_analysis_task", side_effect=receiver.QueuePublishError("消息队列不可用")):
+            failed = self.post(payload)
+        self.assertEqual(failed.status_code, 503)
+        released = [row for row in self.rows() if row["issue_number"] == 13][0]
+        self.assertEqual(released["state"], "queued")
+        with patch.object(receiver, "publish_analysis_task") as again:
+            retried = self.post(payload)
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(retried.json["status"], "duplicate")
+        again.assert_called_once()
+        self.assertEqual([row for row in self.rows() if row["issue_number"] == 13][0]["state"], "dispatching")
+
+    def test_duplicate_dispatching_event_is_not_published_again(self):
+        with patch.object(receiver, "publish_analysis_task") as publish:
+            self.assertEqual(self.post().status_code, 202)
+            self.assertEqual(self.post().status_code, 200)
+        publish.assert_called_once()
+
+    def test_competing_handlers_process_one_event_once_and_store_report(self):
+        with receiver.connect(self.config) as db:
+            for number in range(1, 21):
+                db.execute("""INSERT INTO events(event_id, repository, issue_number, state, updated_at)
+                              VALUES (?, 'example/project', ?, 'dispatching', ?)""",
+                           (f"event-{number}", number, time.time()))
+        calls = []
+
+        def process(config, repository, number, *, client, checks=None):
+            time.sleep(0.01)
+            calls.append(number)
+            return dict(RESULT)
+
+        client = object()
+        with patch.object(worker, "_process_issue", side_effect=process):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                actions = list(pool.map(
+                    lambda number: worker.handle_delivery(
+                        self.config, {"event_id": f"event-{number}"}, False, client=client),
+                    range(1, 21)))
+        self.assertEqual(actions, ["ack"] * 20)
+        self.assertEqual(sorted(calls), list(range(1, 21)))
+        with receiver.connect(self.config) as db:
+            states = [row["state"] for row in db.execute("SELECT state FROM events")]
+            reports = db.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        self.assertEqual(states, ["completed"] * 20)
+        self.assertEqual(reports, 20)
+
+    def test_same_event_is_not_processed_twice(self):
+        with receiver.connect(self.config) as db:
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state, updated_at)
+                          VALUES ('same', 'example/project', 7, 'dispatching', ?)""", (time.time(),))
+        calls = []
+
+        def process(config, repository, number, *, client, checks=None):
+            time.sleep(0.05)
+            calls.append(number)
+            return dict(RESULT)
+
+        with patch.object(worker, "_process_issue", side_effect=process):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                actions = list(pool.map(
+                    lambda _: worker.handle_delivery(self.config, {"event_id": "same"}, False, client=object()),
+                    range(2)))
+        self.assertEqual(sorted(actions), ["ack", "ack"])
+        self.assertEqual(calls, [7])
+
+    def test_exhausted_keys_mark_failed_and_request_dead_letter(self):
+        with receiver.connect(self.config) as db:
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state, updated_at)
+                          VALUES ('dead', 'example/project', 8, 'dispatching', ?)""", (time.time(),))
+        error = IssueProcessingError("全部模型密钥均调用失败", retryable=False, keys_exhausted=True)
+        with patch.object(worker, "_process_issue", side_effect=error):
+            action = worker.handle_delivery(self.config, {"event_id": "dead"}, False, client=object())
+        self.assertEqual(action, "nack")
+        row = self.rows()[0]
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["dead_lettered"], 1)
+        self.assertIn("全部模型密钥均调用失败", row["last_error"])
+        with receiver.connect(self.config) as db:
+            report = db.execute("SELECT status, result FROM reports WHERE event_id='dead'").fetchone()
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("全部模型密钥均调用失败", report["result"])
+
+    def test_retryable_failure_waits_instead_of_dead_letter(self):
+        with receiver.connect(self.config) as db:
+            db.execute("""INSERT INTO events(event_id, repository, issue_number, state, updated_at)
+                          VALUES ('later', 'example/project', 9, 'dispatching', ?)""", (100,))
+        with patch.object(worker, "_process_issue", side_effect=IssueProcessingError("暂时失败")):
+            action = worker.handle_delivery(
+                replace(self.config, database_url=""), {"event_id": "later"}, False, client=object())
+        self.assertEqual(action, "ack")
+        row = self.rows()[0]
+        self.assertEqual(row["state"], "queued")
+        self.assertGreater(row["next_attempt"], 100)
+        self.assertEqual(row["dead_lettered"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

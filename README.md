@@ -57,3 +57,5 @@ flowchart LR
 | POST 内容类型 | `application/json` |
 | 事件类型 | 仅勾选「Issue 事件」|
 | 启用状态 | 勾选「激活」 |
+
+服务端的容器部署、扩容和验证见 [issue-gov-agent/DEPLOY.md](issue-gov-agent/DEPLOY.md)。
