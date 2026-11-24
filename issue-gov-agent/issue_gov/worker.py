@@ -259,7 +259,8 @@ def process_one(
             db.execute("BEGIN IMMEDIATE")
             # 已取得覆盖整个处理过程的文件锁，遗留 running 任务不可能仍由其他进程执行。
             # 退回未完成的这一次尝试；同时恢复旧版本因中断次数耗尽而标记失败的任务。
-            db.execute("""UPDATE events SET state = 'queued', attempts = MAX(attempts - 1, 0),
+            db.execute("""UPDATE events SET state = 'queued',
+                          attempts = CASE WHEN events.attempts - 1 > 0 THEN events.attempts - 1 ELSE 0 END,
                           next_attempt = 0, last_error = '后台处理中断，已重新排队'
                           WHERE state = 'running'
                              OR (state = 'failed' AND last_error = '后台处理超时或中断')""")
@@ -294,32 +295,12 @@ def process_one(
             exc = error if isinstance(error, IssueProcessingError) else IssueProcessingError("治理程序发生内部错误，请检查代码和配置")
             now = time.time() if fixed_now is None else fixed_now
             state, retry_delay = save_failure(config, row["event_id"], attempt, exc, now)
-            if exc.status_code == 429:
-                LOG.warning("AtomGit API 已限流，全部治理任务暂停请求 %s 秒；Webhook 继续接收并保存通知", retry_delay)
-            if state == "superseded":
-                LOG.info("旧请求已被新请求覆盖：仓库=%s，Issue=#%s，停止本次处理，由新请求接替，原因=%s，事件=%s",
-                         row["repository"], row["issue_number"], exc, row["event_id"][:12])
-            else:
-                outcome = (f"将在 {retry_delay} 秒后自动重试" if state == "queued"
-                           else "任务已失败，停止自动重试，请排查原因")
-                LOG.warning("治理处理失败：仓库=%s，Issue=#%s，第 %s/%s 次尝试，%s，原因=%s，事件=%s",
-                            row["repository"], row["issue_number"], attempt, MAX_ATTEMPTS, outcome, exc,
-                            row["event_id"][:12])
+            _log_failure(row["repository"], row["issue_number"], attempt, exc, state, retry_delay,
+                         row["event_id"])
         else:
             now = time.time() if fixed_now is None else fixed_now
             save_success(config, row["event_id"], attempt, result, now)
-            statuses = {"pass": "基础格式通过", "partial_match": "格式待补充", "no_match": "未匹配模板",
-                        "template_error": "模板配置异常，维护者建议已入库", "skipped_closed": "Issue 已关闭",
-                        "skipped_unchanged": "标题和正文已检查，跳过重复处理"}
-            actions = {"created": "已发布评论", "recovered": "已找到先前发布的评论，恢复完成状态", "unchanged": "未重复发布评论",
-                       "updated": "已更新检查评论",
-                       "suppressed": "静默处理，未发表评论",
-                       "skipped_closed": "跳过已关闭的 Issue"}
-            if result.get("maintainer_suggestion_id") is not None:
-                statuses["no_match"] = "检查通过，模板覆盖建议已入库"
-            LOG.info("治理处理完成：仓库=%s，Issue=#%s，检查=%s，评论=%s，事件=%s",
-                     row["repository"], row["issue_number"], statuses.get(result.get("status"), "已处理"),
-                     actions.get(result["comment_action"], "已处理"), row["event_id"][:12])
+            _log_success(row["repository"], row["issue_number"], result, row["event_id"])
         return True
 
 
@@ -411,8 +392,11 @@ def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessi
         retry_delay = max(retry_delay, math.ceil(exc.retry_after))
     with connect(config) as db:
         if exc.status_code == 429:
+            # PostgreSQL 的 MAX() 只是聚合函数；跨方言用 CASE 比较取较大值。
             db.execute("""INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)
-                          ON CONFLICT(name) DO UPDATE SET until = MAX(until, excluded.until)""",
+                          ON CONFLICT(name) DO UPDATE SET until =
+                              CASE WHEN excluded.until > api_cooldown.until
+                                   THEN excluded.until ELSE api_cooldown.until END""",
                        (now + retry_delay,))
         db.execute("""UPDATE events SET
                         state = CASE WHEN state='superseded' THEN state ELSE ? END,

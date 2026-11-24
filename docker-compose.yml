@@ -20,7 +20,8 @@ services:
       timeout: 3s
       retries: 20
     ports:
-      - "${POSTGRES_PORT:-54329}:5432"
+      # 调试端口只绑本机回环；生产环境禁止把数据库直接暴露到公网。
+      - "127.0.0.1:${POSTGRES_PORT:-54329}:5432"
     mem_limit: 512m
     restart: unless-stopped
 
@@ -37,8 +38,9 @@ services:
       timeout: 10s
       retries: 20
     ports:
-      - "${RABBITMQ_PORT:-56729}:5672"
-      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+      # 调试端口只绑本机回环；管理页面如需远程访问请走 SSH 隧道。
+      - "127.0.0.1:${RABBITMQ_PORT:-56729}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
     mem_limit: 512m
     restart: unless-stopped
 

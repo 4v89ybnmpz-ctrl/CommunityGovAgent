@@ -170,7 +170,7 @@ def main() -> None:
     processed: list[int] = []
     lock = threading.Lock()
 
-    def fake_process(config, repository, number, *, client):
+    def fake_process(config, repository, number, *, client, checks=None):
         time.sleep(0.01)
         with lock:
             processed.append(number)

@@ -38,7 +38,7 @@ RabbitMQ
 
 全项目只有这一份 `.env`，不要在仓库根目录再创建。接收服务和全部消费者挂载同一份文件。容器进程只额外设置 `SERVICE_MODE=queue`，服务用文件中的账号和口令拼出连接串，主机名是 `postgres` 和 `rabbitmq`，容器内部端口是 `5432` 和 `5672`。`manage.py` 不设置 `SERVICE_MODE`，因此仍使用 SQLite，不会去解析这两个主机名。
 
-口令只写在 `POSTGRES_PASSWORD` 和 `RABBITMQ_PASSWORD`。口令只用字母和数字。`init` 会把占位符换成随机值。宿主机映射端口由 `POSTGRES_PORT`、`RABBITMQ_PORT` 和 `RABBITMQ_MANAGEMENT_PORT` 决定。本机直接连接时在进程环境中设置 `DATABASE_URL` 和 `RABBITMQ_URL`，不要把这两项写进 `.env`。
+口令只写在 `POSTGRES_PASSWORD` 和 `RABBITMQ_PASSWORD`。口令只用字母和数字。`init` 会把占位符换成随机值。宿主机映射端口由 `POSTGRES_PORT`、`RABBITMQ_PORT` 和 `RABBITMQ_MANAGEMENT_PORT` 决定，且只绑定在 `127.0.0.1`，不对外网开放；远程访问数据库或管理页面请走 SSH 隧道。本机直接连接时在进程环境中设置 `DATABASE_URL` 和 `RABBITMQ_URL`，不要把这两项写进 `.env`。
 
 多个模型密钥写在 `AGENT_API_KEYS`，用英文逗号分隔。每个密钥先请求一次，失败后按 `LLM_KEY_RETRY_INTERVAL`（默认 10 秒）再试 `LLM_KEY_RETRIES` 次（默认 2 次），然后切换下一个密钥。全部失败后任务状态改为 `failed`，`dead_lettered` 为 1，消息进入 `issue.analysis.dlq`。只填写 `AGENT_API_KEY` 时，`manage.py` 仍按原来的任务级重试；容器里的消费者会对这一个密钥执行同样的两次重试，失败后进入死信队列。
 
@@ -101,6 +101,14 @@ cd issue-gov-agent
 ```bash
 cd issue-gov-agent
 .venv/bin/python -m unittest discover -s tests
+```
+
+PostgreSQL 路径测试默认跳过；本机验证时先启动数据库，再设置连接串（CI 已自动执行）：
+
+```bash
+scripts/service compose up -d postgres
+PG_TEST_DATABASE_URL=postgresql://issue:<口令>@127.0.0.1:54329/issue_gov_test \
+  .venv/bin/python -m unittest discover -s tests
 ```
 
 并发与死信（会清空该数据库里的 `events` 和 `reports`，只对验证库执行）：
