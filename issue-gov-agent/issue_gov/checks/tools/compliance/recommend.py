@@ -10,10 +10,9 @@ from typing import Any
 
 from govcommon.errors import ProcessingError
 from issue_gov.checks.tools.compliance.parse import _fields
-from issue_gov.paths import config_dir
+from issue_gov.checks.tools.compliance.rules import RECOMMEND_PROMPT
 
 LLM_TIMEOUT = 120
-RECOMMEND_PROMPT = config_dir() / "recommend_template.md"
 
 def recommend_template(
     title: str, body: str, templates: list[dict[str, Any]],

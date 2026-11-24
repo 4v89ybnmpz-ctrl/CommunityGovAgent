@@ -8,7 +8,7 @@ import yaml
 
 from govcommon.errors import ProcessingError
 from issue_gov.checks.tools.compliance.parse import _fields
-from issue_gov.paths import config_dir
+from issue_gov.checks.tools.compliance.rules import COMMENT_TEMPLATES, load_rules
 
 def _escape_comment_text(value: str) -> str:
     """将模型文本转为评论中的单行文字，避免产生 HTML、链接或提及。
@@ -36,7 +36,7 @@ def render_comment_template(key: str, **fields: Any) -> str:
         KeyError: 模板条目不存在，或缺少必需的占位符值。
         ValueError: 模板中的格式占位符语法无效。
     """
-    path = config_dir() / "comment_templates.yml"
+    path = COMMENT_TEMPLATES
     templates = yaml.safe_load(path.read_text(encoding="utf-8"))
     return templates[key].format_map(fields)
 
@@ -72,13 +72,15 @@ def _format_template(template: dict, *, show_title: bool = True, show_body: bool
             parts.extend(["### " + attrs["label"], ""])
             required = field.get("validations", {}).get("required") or (
                 field["type"] == "checkboxes" and any(option.get("required") for option in attrs["options"]))
-            hints = ["必填" if required else "选填"]
+            spec = load_rules()
+            hints = [spec.copy["required"] if required else spec.copy["optional"]]
             hints.extend(attrs[key] for key in ("description", "placeholder") if attrs.get(key))
             if field["type"] == "dropdown":
-                hints.append(("可多选：" if attrs.get("multiple") else "请选择一项：") + "、".join(attrs["options"]))
+                prefix = spec.copy["dropdown_many"] if attrs.get("multiple") else spec.copy["dropdown_one"]
+                hints.append(prefix + spec.messages["option_joiner"].join(attrs["options"]))
             parts.extend(["<!-- " + "\n".join(hints) + " -->", ""])
             if field["type"] == "checkboxes":
-                content = "\n".join("- [ ] " + option["label"] + (" <!-- 必选 -->" if option.get("required") else "")
+                content = "\n".join("- [ ] " + option["label"] + (spec.copy["checkbox_required"] if option.get("required") else "")
                                     for option in attrs["options"])
             elif field["type"] == "dropdown":
                 content = attrs["options"][attrs["default"]] if "default" in attrs else ""

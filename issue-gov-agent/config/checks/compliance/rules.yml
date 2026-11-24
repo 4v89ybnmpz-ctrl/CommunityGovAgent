@@ -1,0 +1,70 @@
+# 规范性检查的检查规范。调整词表、占位内容和提示文案时只改本文件。
+# 当前取值与原先写在代码中的规则相同。
+
+# 章节名末尾可忽略的必填／选填提示，以及这些提示之间的分隔符。
+section_hint_words:
+  - 必填
+  - 必选
+  - 选填
+  - 可选
+  - required
+  - mandatory
+  - optional
+section_hint_separators: "/／|、"
+
+# 把全角括号和斜杠收成同一种写法后再匹配章节。
+section_normalize:
+  "（": "("
+  "）": ")"
+  "／": "/"
+
+# 字段说明里判定“明确必填”的正则。先去掉否定说法，再看是否出现必填指示。
+required_negation: '(?:非|不(?:是|为)?|无需|无须)\s*(?:必填|必选)|\b(?:not\s+(?:a\s+)?required|not\s+mandatory|non[- ](?:required|mandatory)|optional)\b'
+required_marker: '必填|必选|必须\s*(?:填写|填入|提供|选择|勾选)|\b(?:required|mandatory|must\s+(?:fill|provide|select|check))\b|^[*＊][^*＊\s]|[^*＊][*＊]\s*$'
+
+# Markdown 章节标题上的选填标记，以及整节跳过的说明标题。
+optional_heading: '(?:[（(\[]\s*(?:选填|可选|optional)\s*[）)\]]|(?:^|[：:])\s*(?:选填|可选|optional))\s*$'
+instruction_headings:
+  - 填写说明
+  - 提交说明
+  - 使用说明
+  - instructions
+  - submissioninstructions
+
+# 这些正文内容视为未填写。字段自己的 placeholder 会再并入。
+placeholders:
+  - ""
+  - "_No response_"
+  - "No response"
+
+# 标题前缀去掉这些结尾后，闭合括号可以直接接正文。
+title_colon: ":："
+title_closed_boundary:
+  - "]"
+  - "】"
+  - ")"
+  - "）"
+
+# 标题未命中时，至少这么多个不同必填章节都出现，才按正文识别模板。
+body_match_min_required_sections: 2
+
+messages:
+  title_prefix: "标题应以 {prefix!r} 开头"
+  missing_section: "缺少此必填章节"
+  unchecked_any: "请至少勾选一个选项"
+  unchecked_option: "请勾选必选项："
+  empty_section: "此必填章节为空或仅含占位内容"
+  invalid_option: "请从模板候选项中选择"
+  invalid_option_many: "一个或多个选项："
+  invalid_option_one: "一个选项："
+  option_joiner: "、"
+  markdown_no_required: "Markdown 模板没有可检查的必填章节，无法判定格式是否通过。"
+  no_checkable_rule: "模板缺少可自动检查的标题或必填规则，无法判定格式是否通过。"
+
+# 把仓库模板转成可复制正文时使用的标记。
+copy:
+  required: "必填"
+  optional: "选填"
+  checkbox_required: " <!-- 必选 -->"
+  dropdown_many: "可多选："
+  dropdown_one: "请选择一项："

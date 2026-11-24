@@ -9,6 +9,8 @@ from typing import Any
 from markdown_it import MarkdownIt
 import yaml
 
+from issue_gov.checks.tools.compliance.rules import load_rules
+
 class TemplateLoader(yaml.SafeLoader):
     """保留 Yes/No/On/Off 等选项文字，仅将 true/false 当作布尔值。"""
 
@@ -40,14 +42,12 @@ def _section_key(text: str) -> str:
     仅处理独立提示（含中英双语），保留字段名称中的其他括号内容；
     不用于判断必填规则或匹配复选框选项。
     """
+    spec = load_rules()
     label = "".join(_label(text).split()).casefold()
-    label = label.translate(str.maketrans({"（": "(", "）": ")", "／": "/"}))
-    hint = r"(?:必填|必选|选填|可选|required|mandatory|optional)"
-    hints = hint + r"(?:[/／|、]" + hint + r")*"
-    suffix = rf"(?:\({hints}\)|（{hints}）|\[{hints}\])"
+    label = label.translate(str.maketrans(spec.normalize))
     # 冒号可以位于提示前后；每轮仅移除末尾格式，不删除业务括号。
     while True:
-        stripped = re.sub(rf"(?:{suffix})+$", "", label.rstrip(":："))
+        stripped = spec.section_suffix.sub("", label.rstrip(spec.title_colon))
         if not stripped or stripped == label:
             return label
         label = stripped
@@ -163,12 +163,9 @@ def _required_hint(*texts: str | None) -> bool:
         tokens = MarkdownIt("commonmark").parse(text.replace("<!--", "").replace("-->", ""))
         plain = " ".join(_label(token.content) for token in tokens
                          if token.type in {"inline", "html_block"})
-        plain = re.sub(r"(?:非|不(?:是|为)?|无需|无须)\s*(?:必填|必选)|"
-                       r"\b(?:not\s+(?:a\s+)?required|not\s+mandatory|non[- ](?:required|mandatory)|optional)\b", "", plain,
-                       flags=re.IGNORECASE)
-        if re.search(r"必填|必选|必须\s*(?:填写|填入|提供|选择|勾选)|"
-                     r"\b(?:required|mandatory|must\s+(?:fill|provide|select|check))\b|"
-                     r"^[*＊][^*＊\s]|[^*＊][*＊]\s*$", plain, re.IGNORECASE):
+        spec = load_rules()
+        plain = spec.required_negation.sub("", plain)
+        if spec.required_marker.search(plain):
             return True
     return False
 
@@ -189,8 +186,9 @@ def _markdown_fields(body: str, *, required: bool | None = None) -> list[dict[st
                 for i, token in enumerate(tokens)
                 if token.type == "heading_open" and token.level == 0]
     sections = _sections(body)
-    instructions = {"填写说明", "提交说明", "使用说明", "instructions", "submissioninstructions"}
-    optional = re.compile(r"(?:[（(\[]\s*(?:选填|可选|optional)\s*[）)\]]|(?:^|[：:])\s*(?:选填|可选|optional))\s*$", re.IGNORECASE)
+    spec = load_rules()
+    instructions = spec.instruction_headings
+    optional = spec.optional_heading
     parents: list[tuple[int, bool, bool, bool]] = []
     fields = []
     for index, (start, level, label) in enumerate(headings):

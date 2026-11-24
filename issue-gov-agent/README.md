@@ -22,7 +22,7 @@ community-gov-agent/
 └── issue-gov-agent/
     ├── .env                   # 环境配置，与代码同级，不提交
     ├── repository.yml         # 接入仓库及维护者
-    ├── config/                # 评论模板和推荐提示词，不属于 Python 模块
+    ├── config/checks/compliance/  # 检查规范、评估模板、回复模板，不属于 Python 模块
     ├── issue_gov/             # 接收、消费、检查调度
     │   └── checks/
     │       └── tools/         # 每个检查一个包；规范性检查拆成解析、核对、推荐、评论

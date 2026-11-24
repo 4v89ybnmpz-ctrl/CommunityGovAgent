@@ -8,6 +8,7 @@ from markdown_it import MarkdownIt
 from issue_gov.checks.tools.compliance.parse import (
     _fields, _label, _resolve_section_name, _section_forms, _section_key, _sections,
 )
+from issue_gov.checks.tools.compliance.rules import load_rules
 
 def _checkbox_sections(
     body: str, *, field_keys: set[str] | None = None,
@@ -97,6 +98,8 @@ def check_issue(
     """
     if not templates:
         raise ValueError("至少需要一个模板")
+    spec = load_rules()
+    text = spec.messages
 
     # 本地检查：逐一对照模板的标题前缀、必填章节及占位内容
     title_key = "".join(title.split())
@@ -120,18 +123,19 @@ def check_issue(
         prefix = template.get("title", "").strip()
         prefix_key = "".join(prefix.split())
         title_matches = title_key.startswith(prefix_key)
-        if not title_matches and prefix_key.endswith((":", "：")) and len(prefix_key) > 1:
+        if not title_matches and prefix_key.endswith(tuple(spec.title_colon)) and len(prefix_key) > 1:
             stem = prefix_key[:-1]
             # 闭合括号已构成边界，允许 [Bug]启动失败；普通文字仍需分隔，避免匹配 Buggy。
-            if stem.endswith(("]", "】", ")", "）")):
+            if stem.endswith(spec.title_closed_boundary):
                 title_matches = title_key.startswith(stem)
             else:
                 pattern = r"\s*".join(re.escape(char) for char in stem)
-                title_matches = re.match(r"\s*" + pattern + r"(?=\s|[:：]|$)", title) is not None
+                boundary = "[" + spec.title_colon + "]"
+                title_matches = re.match(r"\s*" + pattern + r"(?=\s|" + boundary + r"|$)", title) is not None
         # 检查标题前缀
         if not title_matches:
             problems.append({"field": "title", "reason": "title_prefix",
-                             "message": f"标题应以 {prefix!r} 开头"})
+                             "message": text["title_prefix"].format(prefix=prefix)})
         required_sections = set()
         # 必填规则已统一为配置与文字指示的并集；已填写的选填下拉框也校验候选值。
         for field in fields:
@@ -147,22 +151,22 @@ def check_issue(
                 continue
             if section_key not in sections:
                 problems.append({"field": label, "reason": "missing_section",
-                                 "message": "缺少此必填章节"})
+                                 "message": text["missing_section"]})
                 continue
             if field["type"] == "checkboxes":
                 selected = selected_options.get(section_key, set())
                 valid = {"".join(_label(option["label"]).split()) for option in attributes["options"]}
                 if required and not selected.intersection(valid):
                     problems.append({"field": label, "reason": "unchecked_required",
-                                     "message": "请至少勾选一个选项"})
+                                     "message": text["unchecked_any"]})
                 for option in required_options:
                     if "".join(_label(option["label"]).split()) not in selected:
                         problems.append({"field": label, "reason": "unchecked_required",
-                                         "message": "请勾选必选项：" + option["label"]})
+                                         "message": text["unchecked_option"] + option["label"]})
                 continue
             content = sections[section_key]
-            placeholders = {"", "_No response_", "No response",
-                            (attributes.get("placeholder") or "").strip()}
+            placeholders = set(spec.placeholders)
+            placeholders.add((attributes.get("placeholder") or "").strip())
             # 下拉选项或预填值本身恰为占位词时，仍按模板允许的真实值处理。
             allowed = attributes.get("options", []) if field["type"] == "dropdown" else []
             # YAML 和 Markdown 使用同一规则；仅改变占位提示的空白仍算未填写。
@@ -173,27 +177,26 @@ def check_issue(
             if is_placeholder and not is_allowed and not is_prefilled:
                 if required:
                     problems.append({"field": label, "reason": "empty_section",
-                                     "message": "此必填章节为空或仅含占位内容"})
+                                     "message": text["empty_section"]})
                 continue
             if field["type"] == "dropdown" and not is_allowed:
                 valid = _matches_dropdown_choice(content_key, allowed) or (
                     attributes.get("multiple", False) and all(
                         _matches_dropdown_choice(option, allowed) for option in content_key.split(",")))
                 if not valid:
+                    choice = text["invalid_option_many"] if attributes.get("multiple", False) else text["invalid_option_one"]
                     problems.append({"field": label, "reason": "invalid_option",
-                                     "message": "请从模板候选项中选择" +
-                                     ("一个或多个选项：" if attributes.get("multiple", False) else "一个选项：") +
-                                     "、".join(allowed)})
+                                     "message": text["invalid_option"] + choice + text["option_joiner"].join(allowed)})
         check = {"template": template["name"], "problems": problems}
         if markdown and not any(field.get("validations", {}).get("required", False) for field in fields):
-            check["limitation"] = "Markdown 模板没有可检查的必填章节，无法判定格式是否通过。"
+            check["limitation"] = text["markdown_no_required"]
         elif not prefix_key and not any(
             field.get("validations", {}).get("required", False)
             or (field["type"] == "checkboxes" and any(
                 option.get("required", False) for option in field["attributes"]["options"]))
             for field in fields
         ):
-            check["limitation"] = "模板缺少可自动检查的标题或必填规则，无法判定格式是否通过。"
+            check["limitation"] = text["no_checkable_rule"]
         checks.append(check)
         if check.get("limitation"):
             continue
@@ -205,7 +208,8 @@ def check_issue(
             matched.append(template["name"])
         # 标题不符时，至少两个不同的必填章节全部出现，才按正文识别模板。
         elif not has_title_match and (
-            (len(required_sections) >= 2 and required_sections <= sections.keys())
+            (len(required_sections) >= spec.body_match_min_required_sections
+             and required_sections <= sections.keys())
             or (not prefix_key and any(
                 _section_key(field["attributes"]["label"]) in sections for field in fields))
         ):
