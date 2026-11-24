@@ -5,8 +5,10 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -73,6 +75,32 @@ class ReceiverTests(unittest.TestCase):
         """
         with receiver.connect(self.config) as db:
             return [dict(r) for r in db.execute("SELECT * FROM events")]
+
+    def test_database_unavailable_defers_ready_without_crashing(self):
+        """回归：建表时数据库不可达，应用仍可创建；/ready 和 /webhook 返回 503，恢复后自动就绪。
+
+        Args:
+            无。
+        Returns:
+            None；验证容器里 Gunicorn 工作进程不会因数据库晚就绪而退出重启。
+        """
+        with patch.object(receiver, "initialize", side_effect=[sqlite3.OperationalError("不可用"), None]):
+            app = receiver.create_app(self.config)
+        app.testing = True
+        with app.test_client() as client:
+            self.assertEqual(client.get("/health").status_code, 200)
+            # 后台线程每 2 秒重试一次；在此之前入口应保持 503
+            self.assertEqual(client.get("/ready").status_code, 503)
+            response = client.post("/webhook", json=self.payload, headers={"X-GitCode-Token": "test-webhook-secret"})
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json, {"error": "initializing"})
+            # 后台重试线程完成第二次 initialize 成功后，入口恢复可用
+            deadline = time.monotonic() + 10
+            while client.get("/ready").status_code != 200 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(client.get("/ready").status_code, 200)
+            response = client.post("/webhook", json=self.payload, headers={"X-GitCode-Token": "test-webhook-secret"})
+            self.assertEqual(response.status_code, 202)
 
     def test_authentication_required_and_never_governs_inline(self):
         """验证 Webhook 拒绝错误密码，合法通知仅入队，不在接收入口执行处理。

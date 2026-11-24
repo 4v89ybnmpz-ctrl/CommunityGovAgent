@@ -63,6 +63,10 @@ class PgConnection:
     def __init__(self, connection) -> None:
         self._connection = connection
 
+    def lock_issue(self, repository: str, number: int) -> None:
+        """按 Issue 加事务级咨询锁，见模块级 lock_issue。"""
+        lock_issue(self, repository, number)
+
     def execute(self, sql: str, params: tuple | list = ()) -> Result:
         statement = sql.strip()
         if statement.upper().startswith("BEGIN"):
@@ -91,7 +95,11 @@ class PgConnection:
 
 @contextmanager
 def connect(database_url: str) -> Iterator[PgConnection]:
-    """打开一次 PostgreSQL 事务，退出时提交或回滚。"""
+    """打开一次 PostgreSQL 事务，退出时提交或回滚。
+
+    会话使用 READ COMMITTED：业务语句都靠 ``UPDATE ... WHERE state = ...`` 做原子状态迁移，
+    接收端入队时用按 Issue 的事务级咨询锁（lock_issue）代替 SQLite 的 BEGIN IMMEDIATE。
+    """
     import psycopg
     from psycopg.rows import dict_row
 
@@ -108,6 +116,17 @@ def connect(database_url: str) -> Iterator[PgConnection]:
         raise
     finally:
         raw.close()
+
+
+def lock_issue(db, repository: str, number: int) -> None:
+    """按 Issue 加事务级咨询锁，使同一 Issue 的入队串行执行；调用方在同一事务内继续写入。
+
+    PostgreSQL 没有 BEGIN IMMEDIATE。行锁在第一条通知到来时无行可锁，
+    因此用 (repository, issue_number) 派生的键做事务级咨询锁：事务结束自动释放，
+    不同 Issue 之间互不阻塞。SQLite 路径不需要这一步，由 BEGIN IMMEDIATE 覆盖。
+    """
+    key = f"{repository}#{number}"
+    db.execute("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", (key,))
 
 
 def initialize(database_url: str) -> None:
@@ -138,6 +157,9 @@ def _schema(connection) -> None:
 
 def claim_due(database_url: str, now: float, *, stale_after: float = 60, limit: int = 20) -> list[dict]:
     """回收超时未领取的任务，并把到期重试任务标记为已投递。
+
+    stale_after 只作用于 dispatching：接收端或重试线程已投递但尚无消费者领取的状态。
+    消费者领取后立即改为 running，正常处理中的任务不会被回收。
 
     Args:
         database_url: PostgreSQL 连接串。

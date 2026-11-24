@@ -43,6 +43,17 @@ def connect(location: DatabaseLocation) -> Iterator[Any]:
         db.close()
 
 
+def lock_issue(db, repository: str, number: int) -> None:
+    """串行化同一 Issue 的任务写入。SQLite 由调用方的 BEGIN IMMEDIATE 负责，这里是空操作。
+
+    PostgreSQL 没有 BEGIN IMMEDIATE，必须显式按 Issue 加事务级咨询锁；
+    接收端在查询、覆盖旧任务和插入新任务之前调用。
+    """
+    wrapper = getattr(db, "lock_issue", None)
+    if wrapper is not None:
+        wrapper(repository, number)
+
+
 def initialize(location: DatabaseLocation) -> None:
     """创建目录、表和索引，并把被更新请求替代的旧任务标为已覆盖。可以重复调用。"""
     if location.database_url:

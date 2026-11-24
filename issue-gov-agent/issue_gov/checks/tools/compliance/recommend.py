@@ -1,5 +1,6 @@
 """规范性检查：在格式未匹配时调用模型推荐模板。"""
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -88,10 +89,8 @@ def recommend_template(
                     output, stderr = process.communicate(data, timeout=LLM_TIMEOUT)
                 finally:
                     # 清理子进程
-                    try:
+                    with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
                     process.wait()
 
         # 解析输出

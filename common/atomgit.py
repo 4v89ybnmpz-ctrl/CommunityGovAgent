@@ -64,8 +64,7 @@ class NoRedirect(HTTPRedirectHandler):
         Returns:
             None，表示不创建后续请求。
         """
-        return None
-
+        return None  # noqa: RET501 -- 覆盖父类签名，显式返回 None 表意更清楚
 
 class AtomGit:
     def __init__(self, token: str, request_interval: float = 1):
@@ -214,6 +213,7 @@ class AtomGit:
         namespace = info.get("namespace") or {}
         if repository != shared and namespace.get("type") in {None, "group"}:
             try:
+                # namespace.type 缺失时先用 /orgs/{owner} 确认是组织；404 表示个人仓库，不再回退。
                 if not namespace.get("type"):
                     self.request("GET", f"/orgs/{owner}")
                 templates = self.templates(shared)

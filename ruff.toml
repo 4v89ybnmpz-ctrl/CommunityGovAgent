@@ -1,0 +1,22 @@
+# 只启用会影响正确性或可读性的规则；纯风格类规则（import 排序、类型注解强制等）不纳入 CI。
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "F",     # pyflakes：未使用 import/变量、未定义名称
+    "E9",    # 语法错误
+    "B",     # bugbear：常见 bug 模式
+    "UP",    # pyupgrade：过时写法
+    "SIM",   # 可简化的控制流
+    "RET",   # return 简化
+]
+ignore = [
+    "UP035", # typing.Iterator/Mapping 仍兼容 3.11，不强求 collections.abc
+    "UP017", # datetime.timezone.utc 与 UTC 等价
+    "SIM117", # 嵌套 with 在跨方言事务代码里更清晰
+]
+
+[lint.per-file-ignores]
+# receiver 转取 queue_snapshot 供 manage.py 和测试使用。
+"issue-gov-agent/issue_gov/receiver.py" = ["F401"]

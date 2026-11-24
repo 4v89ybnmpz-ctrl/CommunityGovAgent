@@ -1,0 +1,22 @@
+# 由 issue-gov-agent/requirements.txt 解析并锁定；CI 和镜像构建使用本文件，保证每次构建版本一致。
+# 升级依赖：修改 requirements.txt 后在 Python 3.11 环境执行
+#   pip install -r requirements.txt && pip freeze | grep -iE '^(Flask|gunicorn|supervisor|python-dotenv|markdown-it-py|PyYAML|pika|psycopg)' > requirements.lock
+# 并把传递依赖一并提交。
+blinker==1.9.0
+click==8.5.1
+Flask==3.1.3
+gunicorn==23.0.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+markdown-it-py==4.3.0
+MarkupSafe==3.0.4
+mdurl==0.1.2
+packaging==26.3
+pika==1.5.0
+psycopg==3.3.9
+psycopg-binary==3.3.9
+python-dotenv==1.2.4
+PyYAML==6.0.4
+supervisor==4.3.0
+typing_extensions==4.16.0
+Werkzeug==3.1.9

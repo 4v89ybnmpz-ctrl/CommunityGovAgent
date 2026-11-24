@@ -25,14 +25,19 @@ class QueuePublishError(Exception):
     """消息未能确认写入队列。不携带连接串或凭据。"""
 
 
-def _parameters(url: str):
-    """构造带超时的连接参数。消费者处理期间由独立线程维持心跳。"""
+def _parameters(url: str, *, timeout: float = 10):
+    """构造带超时的连接参数。消费者处理期间由独立线程维持心跳。
+
+    Args:
+        url: AMQP 连接串。
+        timeout: 单次 socket 连接/读写的超时秒数。就绪探测用短超时，避免代理变慢时拖垮健康检查。
+    """
     import pika
 
     params = pika.URLParameters(url)
     params.heartbeat = 30
     params.blocked_connection_timeout = 10
-    params.socket_timeout = 10
+    params.socket_timeout = timeout
     params.connection_attempts = 2
     params.retry_delay = 1
     return params
@@ -64,12 +69,17 @@ def declare(channel, topology: QueueTopology) -> None:
 
 
 def check(url: str, topology: QueueTopology) -> None:
-    """确认代理可连接并已有分析队列。失败时抛出 QueuePublishError。"""
+    """确认代理可连接并已有分析队列。失败时抛出 QueuePublishError。
+
+    供 /ready 探测调用：单次尝试、2 秒超时，总耗时不超过 3 秒，远小于 Docker 的 5 秒探测超时。
+    """
     import pika
 
     connection = None
     try:
-        connection = pika.BlockingConnection(_parameters(url))
+        params = _parameters(url, timeout=2)
+        params.connection_attempts = 1
+        connection = pika.BlockingConnection(params)
         channel = connection.channel()
         declare(channel, topology)
     except Exception:
@@ -185,3 +195,20 @@ def dead_letter_count(url: str, topology: QueueTopology) -> int:
         return int(result.method.message_count)
     finally:
         connection.close()
+
+
+def purge_queue(url: str, topology: QueueTopology) -> int:
+    """清空死信队列并返回清掉的消息数。连接或声明失败时抛出 QueuePublishError。"""
+    import pika
+
+    connection = None
+    try:
+        connection = pika.BlockingConnection(_parameters(url))
+        channel = connection.channel()
+        declare(channel, topology)
+        return int(channel.queue_purge(queue=topology.dead_letter).method.message_count)
+    except Exception:
+        raise QueuePublishError("消息队列不可用") from None
+    finally:
+        if connection is not None and connection.is_open:
+            connection.close()

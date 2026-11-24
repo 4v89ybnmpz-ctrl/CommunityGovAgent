@@ -50,6 +50,10 @@ services:
       dockerfile: issue-gov-agent/Dockerfile
       target: receiver
     init: true
+    # 应用容器以运行 scripts/service 的用户身份运行（CONTAINER_UID/CONTAINER_GID 由该脚本导出），
+    # 与 manage.py init 生成的 0600 配置文件属主一致。直接执行 docker compose 时需自行导出这两个变量，
+    # 或显式指定 user，例如 user: "1001:1001"。
+    user: "${CONTAINER_UID:-1000}:${CONTAINER_GID:-1000}"
     environment:
       SERVICE_MODE: queue
       WEBHOOK_PORT: "7000"
@@ -79,9 +83,13 @@ services:
       dockerfile: issue-gov-agent/Dockerfile
       target: consumer
     init: true
+    # 与 receiver 相同：按运行 scripts/service 的用户身份读取 0600 的 .env 和 repository.yml。
+    user: "${CONTAINER_UID:-1000}:${CONTAINER_GID:-1000}"
     environment:
       SERVICE_MODE: queue
       CONSUMER_HEALTH_PORT: "7001"
+      # 该用户在镜像里没有 passwd 条目，claude 子进程和 tempfile 需要一个可写的 HOME。
+      HOME: /tmp
     volumes:
       - ./issue-gov-agent/.env:/app/.env:ro
       - ./issue-gov-agent/repository.yml:/app/repository.yml:ro

@@ -38,6 +38,8 @@ RabbitMQ
 
 全项目只有这一份 `.env`，不要在仓库根目录再创建。接收服务和全部消费者挂载同一份文件。容器进程只额外设置 `SERVICE_MODE=queue`，服务用文件中的账号和口令拼出连接串，主机名是 `postgres` 和 `rabbitmq`，容器内部端口是 `5432` 和 `5672`。`manage.py` 不设置 `SERVICE_MODE`，因此仍使用 SQLite，不会去解析这两个主机名。
 
+应用容器以**执行 `scripts/service` 的用户身份**运行（脚本导出 `CONTAINER_UID`/`CONTAINER_GID`，Compose 的 `user:` 取自它们），与 `manage.py init` 生成的 `0600` 配置文件属主一致。需要以其他 uid 运行时，`CONTAINER_UID=1001 CONTAINER_GID=1001 scripts/service up`。直接执行 `docker compose` 时要自行导出这两个变量，否则默认 `1000:1000`。`scripts/service up` 会在启动前检查容器用户能否读取配置，不能时直接给出修复命令并退出。
+
 口令只写在 `POSTGRES_PASSWORD` 和 `RABBITMQ_PASSWORD`。口令只用字母和数字。`init` 会把占位符换成随机值。宿主机映射端口由 `POSTGRES_PORT`、`RABBITMQ_PORT` 和 `RABBITMQ_MANAGEMENT_PORT` 决定，且只绑定在 `127.0.0.1`，不对外网开放；远程访问数据库或管理页面请走 SSH 隧道。本机直接连接时在进程环境中设置 `DATABASE_URL` 和 `RABBITMQ_URL`，不要把这两项写进 `.env`。
 
 多个模型密钥写在 `AGENT_API_KEYS`，用英文逗号分隔。每个密钥先请求一次，失败后按 `LLM_KEY_RETRY_INTERVAL`（默认 10 秒）再试 `LLM_KEY_RETRIES` 次（默认 2 次），然后切换下一个密钥。全部失败后任务状态改为 `failed`，`dead_lettered` 为 1，消息进入 `issue.analysis.dlq`。只填写 `AGENT_API_KEY` 时，`manage.py` 仍按原来的任务级重试；容器里的消费者会对这一个密钥执行同样的两次重试，失败后进入死信队列。
@@ -70,13 +72,15 @@ scripts/service compose stop
 
 `scripts/service up` 在配置缺失时只生成文件并退出，不会用空令牌启动。配置写好后再次执行才会构建镜像并启动。
 
-消费者镜像包含 Node.js 22 和 Claude Code `2.1.316`，构建时需要能下载这两个组件。接收镜像不包含它们。更新消费者时重新构建并执行：
+消费者镜像包含 Node.js 22 和 Claude Code `2.1.316`，构建时需要能下载这两个组件。接收镜像不包含它们。Python 依赖按 `issue-gov-agent/requirements.lock` 安装，与 CI 使用同一组版本；更新依赖时同步修改锁文件。更新消费者时重新构建并执行：
 
 ```bash
 scripts/service compose up -d --build --scale consumer=3 consumer
 ```
 
-RabbitMQ 管理页面默认是 `http://127.0.0.1:15672`（用户和密码与 `RABBITMQ_USER`、`RABBITMQ_PASSWORD` 相同）。死信堆在 `issue.analysis.dlq`。处理完密钥或网络问题后执行 `scripts/service retry`，失败任务会重新进入分析队列。
+RabbitMQ 管理页面默认是 `http://127.0.0.1:15672`（用户和密码与 `RABBITMQ_USER`、`RABBITMQ_PASSWORD` 相同）。死信堆在 `issue.analysis.dlq`。处理完密钥或网络问题后执行 `scripts/service retry`，失败任务会重新进入分析队列，同时清空死信队列中对应上次失败的消息。
+
+同一 Issue 的多条通知在 PostgreSQL 下按 Issue 加咨询锁串行入队，只会留下一条活跃任务，其余标为已覆盖。消费者领取任务时写入持有者标识；消息重投后任务被新消费者接管时，旧持有者的完成或失败写入会被拒绝，不会覆盖接管者的结果。
 
 Webhook 仍是 `http://服务器:7000/webhook`，请求头 `X-GitCode-Token` 使用 `.env` 里的 `WEBHOOK_SECRET`。存活检查是 `GET /health`，数据库和队列都可连接时 `GET /ready` 返回 200。
 
@@ -124,8 +128,9 @@ python3 scripts/concurrency_check.py
 
 | 现象 | 处理 |
 | --- | --- |
+| `scripts/service up` 提示容器用户无法读取配置 | 按提示 `chown <uid>` 该文件，或导出正确的 `UID` 后重试 |
 | `scripts/service up` 提示填写配置 | 编辑 `issue-gov-agent/.env` 和 `repository.yml` 后重试 |
-| `/ready` 持续失败 | `scripts/service compose logs receiver`，确认 Postgres 和 RabbitMQ 健康 |
+| `/ready` 持续失败 | `scripts/service compose logs receiver`，确认 Postgres 和 RabbitMQ 健康；数据库暂不可达时接收进程保持运行并每 2 秒重试，`/ready` 返回 `initializing` |
 | 任务停在 `dispatching` | 消费者未运行或队列确认失败；启动消费者后，超过 60 秒会被重新投递 |
 | 任务 `failed` 且 `dead_lettered=1` | 查看 `last_error` 和死信队列，修复密钥或模型配置后执行 `scripts/service retry` |
 | 修改 `.env` 或仓库名单后未生效 | `scripts/service compose up -d --force-recreate receiver consumer` |

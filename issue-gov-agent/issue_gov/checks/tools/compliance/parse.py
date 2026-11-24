@@ -140,10 +140,9 @@ def _sections(
             token = tokens[i]
             if token.type in {"fence", "code_block"}:
                 parts.append(token.content)
-            elif token.type in {"inline", "html_block"}:
+            elif token.type in {"inline", "html_block"} and tokens[i - 1].type != "heading_open":
                 # 子标题本身不算填写内容；HTML 注释也不算。
-                if tokens[i - 1].type != "heading_open":
-                    parts.append(re.sub(r"<!--[\s\S]*?-->", "", token.content))
+                parts.append(re.sub(r"<!--[\s\S]*?-->", "", token.content))
         sections.setdefault(label, []).append("\n".join(parts).strip())
     return {label: "\n".join(parts).strip() for label, parts in sections.items()}
 

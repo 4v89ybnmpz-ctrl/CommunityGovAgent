@@ -13,8 +13,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app
 
-COPY issue-gov-agent/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY issue-gov-agent/requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
 
 COPY --chown=app:app common /app/common
 COPY --chown=app:app issue-gov-agent/issue_gov /app/issue_gov

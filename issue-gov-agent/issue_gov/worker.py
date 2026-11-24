@@ -279,13 +279,14 @@ def process_one(
             attempt = db.execute("""SELECT MAX(attempts) FROM events WHERE repository = ?
                                     AND issue_number = ? AND state = 'queued'""",
                                  (row["repository"], row["issue_number"])).fetchone()[0] + 1
-            db.execute("""UPDATE events SET state = 'running', attempts = ?, updated_at = ?
+            db.execute("""UPDATE events SET state = 'running', attempts = ?, updated_at = ?, owner = NULL
                           WHERE repository = ? AND issue_number = ? AND state = 'queued'""",
                        (attempt, now, row["repository"], row["issue_number"]))
 
         # 执行处理和评论
         try:
-            stored_checks = row["checks"] if "checks" in row.keys() else None
+            # sqlite3.Row 和 PostgreSQL Row 都支持 keys()；老库可能没有 checks 列。
+            stored_checks = row["checks"] if "checks" in row.keys() else None  # noqa: SIM118
             result = _process_issue(config, row["repository"], row["issue_number"], client=client,
                                     checks=stored_checks)
             if not isinstance(result, dict) or not result.get("comment_action"):
@@ -351,21 +352,48 @@ def retry_failed(config: Config) -> int:
     initialize(config)
     with connect(config) as db:
         count = db.execute("""UPDATE events SET state = 'queued', attempts = 0, dead_lettered = 0,
-                              next_attempt = 0, updated_at = ? WHERE state = 'failed'""",
+                              next_attempt = 0, updated_at = ?, owner = NULL WHERE state = 'failed'""",
                            (time.time(),)).rowcount
     if count and config.rabbitmq_url:
+        # 上次失败时进入死信队列的消息已对应到被重排的任务；不清掉会在下次失败时重复堆积。
+        purge_dead_letters(config.rabbitmq_url, ISSUE_ANALYSIS)
         republish_due(config)
     return count
 
 
-def save_success(config: Config, event_id: str, attempt: int, result: dict, now: float) -> None:
-    """保存处理结果，并写入报告表。已被新请求覆盖的任务保留 superseded。"""
+def purge_dead_letters(url: str, topology) -> int:
+    """清空死信队列并返回清掉的消息数。队列不可达时记录日志并返回 0，不中断重排。"""
+    from common.queueing import QueuePublishError, purge_queue
+
+    try:
+        return purge_queue(url, topology)
+    except QueuePublishError:
+        LOG.error("死信队列不可达，未能清空；不影响失败任务重新入队")
+        return 0
+
+
+def save_success(config: Config, event_id: str, attempt: int, result: dict, now: float,
+                 *, owner: str | None = None) -> bool:
+    """保存处理结果，并写入报告表。已被新请求覆盖的任务保留 superseded。
+
+    owner 是消费者领取任务时写入的持有者标识；给出时只有仍是持有者的写入才生效，
+    防止失联的旧消费者在任务被接管后覆盖结果。SQLite 路径由文件锁保证唯一，不传。
+
+    Returns:
+        结果已写入为 True；任务已被其他消费者接管、本次写入被拒绝时为 False。
+    """
     payload = json.dumps(result, ensure_ascii=False)
     with connect(config) as db:
-        db.execute("""UPDATE events SET state = CASE WHEN state='superseded' THEN state ELSE 'completed' END,
-                      result = ?, last_error = NULL, updated_at = ?
-                      WHERE event_id = ? AND attempts = ? AND state IN ('running', 'superseded')""",
-                   (payload, now, event_id, attempt))
+        # owner 为空表示 SQLite 路径（文件锁已保证唯一）；非空时只有仍是持有者的写入才生效。
+        # 不用 "? IS NULL OR owner = ?" 的写法：psycopg 无法推断绑定为 NULL 的参数类型。
+        guard = " AND (owner = ? OR owner IS NULL OR state = 'superseded')" if owner is not None else ""
+        updated = db.execute(f"""UPDATE events SET state = CASE WHEN state='superseded' THEN state ELSE 'completed' END,
+                      result = ?, last_error = NULL, updated_at = ?, owner = NULL
+                      WHERE event_id = ? AND attempts = ? AND state IN ('running', 'superseded'){guard}""",
+                   (payload, now, event_id, attempt, *((owner,) if owner is not None else ())))
+        if updated.rowcount == 0:
+            # 任务已被其他消费者接管，不写报告，避免覆盖接管者的结果。
+            return False
         db.execute("""INSERT INTO reports (event_id, repository, issue_number, status,
                       recommendation_status, comment_action, checks, result, created_at)
                       SELECT event_id, repository, issue_number, ?, ?, ?, checks, ?, ?
@@ -381,16 +409,32 @@ def save_success(config: Config, event_id: str, attempt: int, result: dict, now:
                         issue_number=excluded.issue_number""",
                    (result.get("status"), result.get("recommendation_status"),
                     result.get("comment_action"), payload, now, event_id))
+    return True
 
 
-def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessingError, now: float) -> tuple[str, float]:
-    """记录失败、安排退避或标记最终失败。全部密钥失败时同时标上死信。"""
+def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessingError, now: float,
+                 *, owner: str | None = None) -> tuple[str, float]:
+    """记录失败、安排退避或标记最终失败。全部密钥失败时同时标上死信。
+
+    owner 是消费者领取任务时写入的持有者标识；给出时只有仍是持有者的写入才生效，
+    已被接管的任务直接返回其当前状态，不再安排重试或写报告。
+    """
     mark_dead = bool(exc.keys_exhausted)
     state = "queued" if exc.retryable and not mark_dead and attempt < MAX_ATTEMPTS else "failed"
     retry_delay = min(30 * 2 ** (attempt - 1), 300)
     if exc.status_code == 429:
         retry_delay = max(retry_delay, math.ceil(exc.retry_after))
     with connect(config) as db:
+        current = db.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+        if current is None:
+            return "missing", retry_delay
+        # 旧库可能没有 owner 列；没有持有者信息时不做接管校验，沿用原来的写入语义。
+        holder = current["owner"] if "owner" in current.keys() else None  # noqa: SIM118
+        if owner is not None and holder not in (owner, None) and current["state"] != "superseded":
+            # 任务已被其他消费者接管，本次失败不属于当前持有者，不覆盖它的状态。
+            return "taken_over", retry_delay
+        # 与 save_success 相同的持有者守卫；不用 "? IS NULL OR owner = ?" 以免 psycopg 无法推断参数类型。
+        guard = " AND (owner = ? OR owner IS NULL OR state = 'superseded')" if owner is not None else ""
         if exc.status_code == 429:
             # PostgreSQL 的 MAX() 只是聚合函数；跨方言用 CASE 比较取较大值。
             db.execute("""INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)
@@ -398,13 +442,14 @@ def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessi
                               CASE WHEN excluded.until > api_cooldown.until
                                    THEN excluded.until ELSE api_cooldown.until END""",
                        (now + retry_delay,))
-        db.execute("""UPDATE events SET
+        db.execute(f"""UPDATE events SET
                         state = CASE WHEN state='superseded' THEN state ELSE ? END,
-                        next_attempt = ?, last_error = ?, updated_at = ?,
+                        next_attempt = ?, last_error = ?, updated_at = ?, owner = NULL,
                         dead_lettered = CASE WHEN state='superseded' THEN dead_lettered
                                              WHEN ? = 1 THEN 1 ELSE dead_lettered END
-                      WHERE event_id = ? AND attempts = ? AND state IN ('running', 'superseded')""",
-                   (state, now + retry_delay, str(exc), now, 1 if mark_dead else 0, event_id, attempt))
+                      WHERE event_id = ? AND attempts = ? AND state IN ('running', 'superseded'){guard}""",
+                   (state, now + retry_delay, str(exc), now, 1 if mark_dead else 0, event_id, attempt,
+                    *((owner,) if owner is not None else ())))
         current = db.execute("SELECT state FROM events WHERE event_id=?", (event_id,)).fetchone()[0]
         if current == "failed":
             db.execute("""INSERT INTO reports (event_id, repository, issue_number, status,
@@ -478,23 +523,27 @@ def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client:
         if state == "failed":
             return "nack" if row["dead_lettered"] else "ack"
         cooldown = db.execute("SELECT until FROM api_cooldown WHERE name = 'atomgit'").fetchone()
-        if cooldown is not None and cooldown["until"] > now and state in ("queued", "dispatching", "running"):
+        if cooldown is not None and cooldown["until"] > now and state in ("queued", "dispatching"):
+            # 只推迟尚未开始处理的任务；running 行由正在执行的消费者持有，改回 queued 会让它的完成写入落空。
             db.execute("""UPDATE events SET state='queued', next_attempt=?
-                          WHERE event_id=? AND state IN ('queued', 'dispatching', 'running')""",
+                          WHERE event_id=? AND state IN ('queued', 'dispatching')""",
                        (max(cooldown["until"], row["next_attempt"]), event_id))
             return "ack"
         if state == "queued" and row["next_attempt"] > now:
             return "ack"
         if state == "running" and not redelivered:
             return "ack"
+        owner = secrets.token_hex(8)
         if state == "running" and redelivered:
+            # 原持有者失联后接管：换上自己的标识，旧持有者此后的完成写入会被拒绝。
             attempt = int(row["attempts"])
-            db.execute("UPDATE events SET updated_at=? WHERE event_id=? AND state='running'", (now, event_id))
+            db.execute("UPDATE events SET updated_at=?, owner=? WHERE event_id=? AND state='running'",
+                       (now, owner, event_id))
         else:
             attempt = int(row["attempts"]) + 1
-            updated = db.execute("""UPDATE events SET state='running', attempts=?, updated_at=?
+            updated = db.execute("""UPDATE events SET state='running', attempts=?, updated_at=?, owner=?
                                     WHERE event_id=? AND state IN ('queued', 'dispatching')""",
-                                 (attempt, now, event_id))
+                                 (attempt, now, owner, event_id))
             if updated.rowcount == 0:
                 return "ack"
 
@@ -504,14 +553,22 @@ def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client:
             raise IssueProcessingError("治理程序未返回有效处理结果")
     except Exception as error:
         exc = error if isinstance(error, IssueProcessingError) else IssueProcessingError("治理程序发生内部错误，请检查代码和配置")
-        final, retry_delay = save_failure(config, event_id, attempt, exc, time.time())
+        final, retry_delay = save_failure(config, event_id, attempt, exc, time.time(), owner=owner)
+        if final == "taken_over":
+            # 任务已被其他消费者接管：本次失败未写入，不按失败记录日志。
+            LOG.info("任务已被其他消费者接管，本次失败不再记录：仓库=%s，Issue=#%s，事件=%s",
+                     repository, number, event_id[:12])
+            return "ack"
         _log_failure(repository, number, attempt, exc, final, retry_delay, event_id)
         if final == "superseded":
             return "ack"
         if exc.keys_exhausted and final == "failed":
             return "nack"
         return "ack"
-    save_success(config, event_id, attempt, result, time.time())
+    if not save_success(config, event_id, attempt, result, time.time(), owner=owner):
+        LOG.info("任务已被其他消费者接管，本次结果不写入：仓库=%s，Issue=#%s，事件=%s",
+                 repository, number, event_id[:12])
+        return "ack"
     _log_success(repository, number, result, event_id)
     return "ack"
 

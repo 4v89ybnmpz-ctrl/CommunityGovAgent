@@ -153,6 +153,106 @@ class PostgresPathTests(unittest.TestCase):
         self.assertEqual(actions, ["ack"] * 4)
         self.assertEqual(calls, [1], "并发领取后只应执行一次处理")
 
+    def test_concurrent_webhooks_for_one_issue_leave_single_active_task(self):
+        """回归：PostgreSQL 下 BEGIN IMMEDIATE 是空操作，同一 Issue 的并发入队必须仍然只留一条活跃任务。
+
+        修复前 8 条并发通知会得到 6 条 queued；现在用按 Issue 的咨询锁串行化后应为 1 条 queued。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        import issue_gov.receiver as receiver
+        self._reset()
+        with self.connect() as db:
+            db.execute("DELETE FROM events")
+        config = _config(self.url)
+        app = receiver.create_app(config)
+        payload = {"object_kind": "issue", "project": {"path_with_namespace": "example/repo"},
+                   "object_attributes": {"action": "open", "iid": 77, "state": "open"}}
+
+        def post(index):
+            body = {**payload, "uuid": f"concurrent-{index}"}
+            return app.test_client().post("/webhook", headers={"X-GitCode-Token": "test-secret"}, json=body).status_code
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            statuses = list(pool.map(post, range(8)))
+        self.assertEqual(statuses, [202] * 8)
+        with self.connect() as db:
+            states = [row["state"] for row in db.execute(
+                "SELECT state FROM events WHERE issue_number = 77").fetchall()]
+        self.assertEqual(len(states), 8)
+        self.assertEqual(states.count("queued"), 1, f"只能有一条活跃任务，实际状态：{states}")
+        self.assertEqual(states.count("superseded"), 7)
+
+    def test_cooldown_does_not_requeue_running_task(self):
+        """回归：限流冷却只能推迟尚未开始的任务，不能把 running 改回 queued，否则持有者的完成写入会落空。"""
+        from unittest.mock import patch
+        import issue_gov.worker as worker
+        self._reset(state="running", attempts=1)
+        now = time.time()
+        with self.connect() as db:
+            db.execute("INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)", (now + 60,))
+        config = _config(self.url)
+
+        def process(config_, repository, number, *, client, checks=None):
+            # 冷却不改 running 时，消息走接管分支并真正执行处理；这里让它成功完成。
+            return {"status": "pass", "comment_action": "suppressed"}
+
+        with patch.object(worker, "_process_issue", side_effect=process):
+            action = worker.handle_delivery(config, {"event_id": "pg-evt-1"}, True, client=object())
+        self.assertEqual(action, "ack")
+        with self.connect() as db:
+            row = db.execute("SELECT state, attempts FROM events").fetchone()
+        self.assertEqual((row["state"], row["attempts"]), ("completed", 1),
+                         "running 任务不得被冷却分支改回 queued，应正常完成")
+        # 对照：queued 任务在冷却期内被推迟，等待到期重投
+        self._reset(state="queued", attempts=0)
+        with self.connect() as db:
+            db.execute("INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)", (now + 60,))
+        action = worker.handle_delivery(config, {"event_id": "pg-evt-1"}, False, client=object())
+        self.assertEqual(action, "ack")
+        with self.connect() as db:
+            row = db.execute("SELECT state, next_attempt FROM events").fetchone()
+        self.assertEqual(row["state"], "queued")
+        self.assertGreaterEqual(row["next_attempt"], now + 59)
+
+    def test_stale_owner_cannot_overwrite_takeover_result(self):
+        """回归：消息重投后任务被新消费者接管，旧持有者的完成写入必须被拒绝。"""
+        import issue_gov.worker as worker
+        self._reset(state="running", attempts=1)
+        with self.connect() as db:
+            db.execute("UPDATE events SET owner = 'new-owner'")
+        config = _config(self.url)
+        written = worker.save_success(config, "pg-evt-1", 1, {"status": "pass", "comment_action": "created"},
+                                      time.time(), owner="stale-owner")
+        self.assertFalse(written, "旧持有者的写入应被拒绝")
+        with self.connect() as db:
+            row = db.execute("SELECT state, result, owner FROM events").fetchone()
+            reports = db.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        self.assertEqual(row["state"], "running", "旧持有者不能把任务标为 completed")
+        self.assertIsNone(row["result"])
+        self.assertEqual(row["owner"], "new-owner")
+        self.assertEqual(reports, 0, "旧持有者的结果不应写入 reports")
+        # 新持有者自己的写入照常生效
+        written = worker.save_success(config, "pg-evt-1", 1, {"status": "pass", "comment_action": "created"},
+                                      time.time(), owner="new-owner")
+        self.assertTrue(written)
+        with self.connect() as db:
+            row = db.execute("SELECT state, owner FROM events").fetchone()
+        self.assertEqual((row["state"], row["owner"]), ("completed", None))
+
+    def test_failure_by_stale_owner_keeps_takeover_state(self):
+        """回归：旧持有者的失败写入同样不得覆盖接管者的状态或安排重试。"""
+        import issue_gov.worker as worker
+        self._reset(state="running", attempts=1)
+        with self.connect() as db:
+            db.execute("UPDATE events SET owner = 'new-owner'")
+        config = _config(self.url)
+        exc = IssueProcessingError("临时错误", retryable=True)
+        state, _ = worker.save_failure(config, "pg-evt-1", 1, exc, time.time(), owner="stale-owner")
+        self.assertEqual(state, "taken_over")
+        with self.connect() as db:
+            row = db.execute("SELECT state, attempts, next_attempt, owner FROM events").fetchone()
+        self.assertEqual((row["state"], row["attempts"], row["owner"]), ("running", 1, "new-owner"))
+
 
 if __name__ == "__main__":
     unittest.main()

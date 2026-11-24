@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from typing import Any
 
@@ -20,7 +21,9 @@ from dotenv import dotenv_values
 
 from common.pgstore import DatabaseError
 from common.queueing import QueuePublishError, publish_analysis_task
-from common.store import connect, initialize, queue_snapshot
+from common.store import connect, initialize, lock_issue
+# queue_snapshot 供 manage.py 和测试从本模块转取；ruff 的 F401 可忽略。
+from common.store import queue_snapshot  # noqa: F401
 import issue_gov.paths as paths
 from issue_gov.checks.base import default_checks, dump_checks
 from issue_gov.queues import ISSUE_ANALYSIS
@@ -99,9 +102,16 @@ def create_app(config: Config | None = None) -> Flask:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # 读取配置并创建数据库、表和索引
+    # 读取配置；先同步建表，数据库暂时不可达时转到后台重试，就绪前 /ready 和 /webhook 返回 503
     config = config or Config.from_file()
-    initialize(config)
+    ready_event = threading.Event()
+    try:
+        initialize(config)
+    except (sqlite3.Error, DatabaseError, OSError):
+        LOG.error("数据库尚未就绪，转到后台重试初始化")
+        _retry_initialize_in_background(config, ready_event)
+    else:
+        ready_event.set()
 
     # 创建应用，限制请求体大小为 1MB
     app = Flask(__name__)
@@ -120,7 +130,9 @@ def create_app(config: Config | None = None) -> Flask:
 
     @app.get("/ready")
     def ready() -> tuple[Response, int]:
-        """确认数据库可读写；服务模式下同时确认消息队列可连接。"""
+        """确认数据库已初始化且可读写；服务模式下同时确认消息队列可连接。"""
+        if not ready_event.is_set():
+            return jsonify(status="initializing"), 503
         try:
             with connect(config) as db:
                 db.execute("SELECT 1")
@@ -139,7 +151,7 @@ def create_app(config: Config | None = None) -> Flask:
             无显式参数；请求头和 JSON 请求体从 Flask 当前请求中读取。
         Returns:
             JSON 响应及 HTTP 状态码：新事件入队为 202，重复或忽略为 200；
-            认证失败为 401，负载不合法为 400，队列写入失败为 503。
+            认证失败为 401，负载不合法为 400，数据库未就绪或队列写入失败为 503。
             请求体超过应用大小限制时，由 Flask 返回 413。
         """
 
@@ -152,7 +164,11 @@ def create_app(config: Config | None = None) -> Flask:
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             return jsonify(error="expected JSON object"), 400
-        
+
+        # 表尚未建好时让通知方稍后重试，不在请求线程里等待初始化
+        if not ready_event.is_set():
+            return jsonify(error="initializing"), 503
+
         # 筛选需要处理的 Issue
         try:
             selected = select_issue(payload, config.repositories)
@@ -177,6 +193,8 @@ def create_app(config: Config | None = None) -> Flask:
         try:
             with connect(config) as db:
                 db.execute("BEGIN IMMEDIATE")
+                # PostgreSQL 下 BEGIN 是空操作，用按 Issue 的咨询锁让同一 Issue 的入队串行执行
+                lock_issue(db, repository, number)
                 row = db.execute("SELECT state, checks FROM events WHERE event_id = ?", (event_id,)).fetchone()
                 added = row is None
                 stored_state = "" if row is None else row["state"]
@@ -227,6 +245,30 @@ def create_app(config: Config | None = None) -> Flask:
                        state="queued" if added else stored_state), 202 if added else 200
 
     return app
+
+
+def _retry_initialize_in_background(config: Config, done: threading.Event) -> None:
+    """数据库暂不可达时在守护线程里每 2 秒重试建表，成功后置位 done。
+
+    就绪前 /ready 和 /webhook 返回 503，容器编排据此等待，
+    而不是让工作进程退出后反复重启。
+
+    Args:
+        config: 服务配置。
+        done: 初始化成功后被 set 的 threading.Event。
+    """
+    def run() -> None:
+        while True:
+            time.sleep(2)
+            try:
+                initialize(config)
+            except (sqlite3.Error, DatabaseError, OSError):
+                LOG.error("数据库尚未就绪，2 秒后重试初始化")
+                continue
+            done.set()
+            return
+
+    threading.Thread(target=run, name="issue-gov-init", daemon=True).start()
 
 
 def _release_dispatch(config: Config, event_id: str) -> None:
