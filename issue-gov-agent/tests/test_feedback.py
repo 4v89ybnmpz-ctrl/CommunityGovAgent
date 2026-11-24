@@ -8,8 +8,11 @@ import unittest
 from unittest.mock import patch
 from markdown_it import MarkdownIt
 
-import issue_gov.checks.compliance.implementation as compliance
-from govcommon.errors import IssueProcessingError
+import issue_gov.checks.tools.compliance.check as compliance_check
+import issue_gov.checks.tools.compliance.comment as compliance_comment
+import issue_gov.checks.tools.compliance.parse as compliance_parse
+import issue_gov.checks.tools.compliance.recommend as compliance_recommend
+from common.errors import IssueProcessingError
 import issue_gov.receiver as receiver
 
 TEMPLATE = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
@@ -29,12 +32,12 @@ class FeedbackTests(unittest.TestCase):
         Returns:
             经过 recommend_template 校验和规范化的推荐结果。
         """
-        with patch.object(compliance.subprocess, "Popen") as popen, patch.object(compliance.os, "killpg"):
+        with patch.object(compliance_recommend.subprocess, "Popen") as popen, patch.object(compliance_recommend.os, "killpg"):
             process = popen.return_value.__enter__.return_value
             process.returncode = 0
             process.communicate.return_value = (json.dumps({"type": "result", "subtype": "success", "is_error": False,
                                                            "result": json.dumps(suggestion)}), "")
-            return compliance.recommend_template("启动失败", "崩溃了", [TEMPLATE], "key", "model", "https://model.example")
+            return compliance_recommend.recommend_template("启动失败", "崩溃了", [TEMPLATE], "key", "model", "https://model.example")
 
     def comment(self, recommendation, **kwargs):
         """为未匹配模板的测试样本生成最终评论。
@@ -45,8 +48,8 @@ class FeedbackTests(unittest.TestCase):
         Returns:
             包含检查结果及相应字段的 Markdown 评论。
         """
-        result = compliance.check_issue("启动失败", "崩溃了", [TEMPLATE])
-        return compliance.format_compliance_check({**result, "recommendation": recommendation},
+        result = compliance_check.check_issue("启动失败", "崩溃了", [TEMPLATE])
+        return compliance_comment.format_compliance_check({**result, "recommendation": recommendation},
                                        templates=[TEMPLATE], **kwargs)
 
     def test_no_applicable_template_preserves_advice(self):
@@ -81,9 +84,9 @@ class FeedbackTests(unittest.TestCase):
         reason = "只有 test，请说明遇到的现象或希望增加的功能。"
         result = self.recommend({"status": "insufficient_info", "template": None, "reason": reason, "maintainer": None})
         self.assertEqual(result["status"], "insufficient_info")
-        documentation = compliance.parse_template('---\nname: 文档反馈\ntitle: "[文档] "\n---\n### 文档链接\n请填写链接\n', 'doc.md')
+        documentation = compliance_parse.parse_template('---\nname: 文档反馈\ntitle: "[文档] "\n---\n### 文档链接\n请填写链接\n', 'doc.md')
         templates = [TEMPLATE, documentation]
-        comment = compliance.format_compliance_check({"status": "no_match", "recommendation": result},
+        comment = compliance_comment.format_compliance_check({"status": "no_match", "recommendation": result},
                                           templates=templates)
         self.assertIn("### 提交内容规范性检查：未通过", comment)
         self.assertIn(reason, comment)
@@ -112,7 +115,7 @@ class FeedbackTests(unittest.TestCase):
         """
         result = self.recommend(SUGGESTION)
         other = {**TEMPLATE, "name": "功能需求", "title": "[Feature] "}
-        comment = compliance.format_compliance_check({"status": "no_match", "recommendation": result},
+        comment = compliance_comment.format_compliance_check({"status": "no_match", "recommendation": result},
                                           templates=[other, TEMPLATE])
         self.assertEqual(comment.count("<details>"), 1)
         self.assertIn("<summary>展开显示模板内容，将模板内容复制到 Issue 中填写。</summary>", comment)
@@ -131,7 +134,7 @@ class FeedbackTests(unittest.TestCase):
             None；核对摘要转义及代码块仍完整可读。
         """
         template = {**TEMPLATE, "name": '反馈</summary></details><script> @someone'}
-        comment = "\n".join(compliance._format_template(template, show_name=True))
+        comment = "\n".join(compliance_comment._format_template(template, show_name=True))
         rendered = MarkdownIt("commonmark").render(comment)
         self.assertEqual(rendered.count("<details>"), 1)
         self.assertEqual(rendered.count("</details>"), 1)
@@ -156,7 +159,7 @@ class FeedbackTests(unittest.TestCase):
         result = self.recommend(suggestion)
         self.assertEqual(result["status"], "recommended")
         self.assertNotIn("draft", result)
-        comment = compliance.format_compliance_check({"status": "no_match", "recommendation": result}, templates=[template])
+        comment = compliance_comment.format_compliance_check({"status": "no_match", "recommendation": result}, templates=[template])
         tokens = MarkdownIt("commonmark").parse(comment)
         fences = [t.content for t in tokens if t.type == "fence"]
         self.assertEqual(fences[0], "[Bug] \n")
@@ -176,9 +179,9 @@ class FeedbackTests(unittest.TestCase):
             None；核对原 Issue 的标题和正文未被填入模板。
         """
         raw = '```bash\necho "hello"\n```\n[日志](https://example.com/log)'
-        result = compliance.check_issue("[Bug] 启动失败", "### 问 题描述\n" + raw, [TEMPLATE])
+        result = compliance_check.check_issue("[Bug] 启动失败", "### 问 题描述\n" + raw, [TEMPLATE])
         self.assertEqual(result["status"], "partial_match")
-        comment = compliance.format_compliance_check(result, templates=[TEMPLATE])
+        comment = compliance_comment.format_compliance_check(result, templates=[TEMPLATE])
         self.assertIn("此 Issue 已使用 **缺陷反馈** 模板，但仍有以下未匹配项：", comment)
         self.assertIn("#### 模板完善建议", comment)
         self.assertNotIn("建议使用：", comment)
@@ -202,7 +205,7 @@ class FeedbackTests(unittest.TestCase):
             Returns:
                 None；断言不满足时测试失败。
             """
-        markdown = compliance.parse_template(
+        markdown = compliance_parse.parse_template(
             '---\nname: 缺陷反馈\ntitle: "[Bug] "\n---\n'
             '### 问题描述（必填）\n<!-- 请填写 -->\n### 复现步骤（必填）\n<!-- 请填写 -->', 'bug.md')
         cases = [
@@ -213,9 +216,9 @@ class FeedbackTests(unittest.TestCase):
         for template in (TEMPLATE, markdown):
             for title, body, expected_parts in cases:
                 with self.subTest(format=template.get('format', 'yaml'), parts=expected_parts):
-                    result = compliance.check_issue(title, body, [template])
+                    result = compliance_check.check_issue(title, body, [template])
                     self.assertEqual(result['status'], 'partial_match')
-                    comment = compliance.format_compliance_check(result, templates=[template])
+                    comment = compliance_comment.format_compliance_check(result, templates=[template])
                     fences = [t for t in MarkdownIt('commonmark').parse(comment) if t.type == 'fence']
                     self.assertEqual([t.info for t in fences], expected_parts)
                     self.assertEqual('**模板标题**' in comment, 'text' in expected_parts)
@@ -237,8 +240,8 @@ class FeedbackTests(unittest.TestCase):
             """
         template = {**TEMPLATE, 'body': [
             {'type': 'textarea', 'attributes': {'label': 'title'}, 'validations': {'required': True}}]}
-        result = compliance.check_issue('[Bug] 启动失败', '', [template])
-        comment = compliance.format_compliance_check(result, templates=[template])
+        result = compliance_check.check_issue('[Bug] 启动失败', '', [template])
+        comment = compliance_comment.format_compliance_check(result, templates=[template])
         self.assertIn('**模板正文（Markdown）**', comment)
         self.assertNotIn('**模板标题**', comment)
 
@@ -261,7 +264,7 @@ class FeedbackTests(unittest.TestCase):
             {"type": "textarea", "attributes": {"label": "日志", "render": "shell", "value": "echo test"}},
         ]}
         original = deepcopy(template)
-        comment = "\n".join(compliance._format_template(template))
+        comment = "\n".join(compliance_comment._format_template(template))
         fences = [t.content for t in MarkdownIt("commonmark").parse(comment) if t.type == "fence"]
         copied = {"title": fences[0].removesuffix("\n"), "body": fences[1].removesuffix("\n")}
         self.assertEqual(copied["title"], "[Bug] ")
@@ -290,7 +293,7 @@ class FeedbackTests(unittest.TestCase):
                                                'default': 0}, 'validations': {'required': True}},
         ]}
         original = deepcopy(template)
-        comment = '\n'.join(compliance._format_template(template))
+        comment = '\n'.join(compliance_comment._format_template(template))
         fences = [t.content for t in MarkdownIt('commonmark').parse(comment) if t.type == 'fence']
         self.assertEqual(len(fences), 2)
         copied = fences[1]
@@ -301,15 +304,15 @@ class FeedbackTests(unittest.TestCase):
         self.assertIn('### 平台', copied)
         self.assertIn('请选择一项：Linux、Windows', copied)
         self.assertIn('\nLinux\n', copied)
-        self.assertEqual(compliance.check_issue('[Bug] 错误', copied, [template])['status'], 'partial_match')
+        self.assertEqual(compliance_check.check_issue('[Bug] 错误', copied, [template])['status'], 'partial_match')
         filled = copied.replace('<!-- 请填写 -->', '启动失败')
-        self.assertEqual(compliance.check_issue('[Bug] 错误', filled, [template])['status'], 'pass')
-        with patch.object(compliance.subprocess, 'Popen') as popen, patch.object(compliance.os, 'killpg'):
+        self.assertEqual(compliance_check.check_issue('[Bug] 错误', filled, [template])['status'], 'pass')
+        with patch.object(compliance_recommend.subprocess, 'Popen') as popen, patch.object(compliance_recommend.os, 'killpg'):
             process = popen.return_value.__enter__.return_value
             process.returncode = 0
             process.communicate.return_value = (json.dumps({'type': 'result', 'subtype': 'success',
                 'is_error': False, 'result': json.dumps(SUGGESTION)}), '')
-            result = compliance.recommend_template('启动失败', '崩溃了', [template], 'key', 'model', 'https://model.example')
+            result = compliance_recommend.recommend_template('启动失败', '崩溃了', [template], 'key', 'model', 'https://model.example')
         self.assertEqual(result['status'], 'recommended')
         fields = json.loads(process.communicate.call_args.args[0])['templates'][0]['fields']
         self.assertEqual([(f['label'], f['required']) for f in fields],
@@ -318,9 +321,9 @@ class FeedbackTests(unittest.TestCase):
         for label in ('详细信息', '', None):
             with self.subTest(label=label):
                 template['body'][1]['attributes']['label'] = label
-                self.assertEqual('\n'.join(compliance._format_template(template)), comment)
-                self.assertEqual(compliance.check_issue('[Bug] 错误', copied, [template])['status'], 'partial_match')
-                self.assertEqual(compliance.check_issue('[Bug] 错误', filled, [template])['status'], 'pass')
+                self.assertEqual('\n'.join(compliance_comment._format_template(template)), comment)
+                self.assertEqual(compliance_check.check_issue('[Bug] 错误', copied, [template])['status'], 'partial_match')
+                self.assertEqual(compliance_check.check_issue('[Bug] 错误', filled, [template])['status'], 'pass')
 
     def test_markdown_template_body_is_preserved(self):
         """Markdown 模板直接提供原始正文，包括说明、代码和选填章节。
@@ -331,8 +334,8 @@ class FeedbackTests(unittest.TestCase):
             None；核对复制内容与模板正文逐字相同。
         """
         body = "说明\n\n### 问题\n<!-- 请填写 -->\n\n### 日志（选填）\n```text\n示例\n```\n"
-        template = compliance.parse_template('---\nname: 问题反馈\ntitle: "[问题] "\n---\n' + body, "issue.md")
-        comment = "\n".join(compliance._format_template(template))
+        template = compliance_parse.parse_template('---\nname: 问题反馈\ntitle: "[问题] "\n---\n' + body, "issue.md")
+        comment = "\n".join(compliance_comment._format_template(template))
         fences = [t.content for t in MarkdownIt("commonmark").parse(comment) if t.type == "fence"]
         self.assertEqual(fences, ["[问题] \n", body + "\n"])
 
@@ -344,7 +347,7 @@ class FeedbackTests(unittest.TestCase):
         Returns:
             None；核对结果非空、栏目顺序及维护者提及范围。
         """
-        partial = compliance.check_issue("[Bug] 失败", "### 问题描述\n失败", [TEMPLATE])
+        partial = compliance_check.check_issue("[Bug] 失败", "### 问题描述\n失败", [TEMPLATE])
         cases = [
             (partial, ["原因：部分匹配现有模板", "模板完善建议：缺陷反馈"]),
             ({"status": "no_match", "recommendation": SUGGESTION},
@@ -354,7 +357,7 @@ class FeedbackTests(unittest.TestCase):
         ]
         for result, headings in cases:
             with self.subTest(result=result):
-                comment = compliance.format_compliance_check(result, templates=[TEMPLATE])
+                comment = compliance_comment.format_compliance_check(result, templates=[TEMPLATE])
                 tokens = MarkdownIt("commonmark").parse(comment)
                 actual = [tokens[i + 1].content for i, token in enumerate(tokens)
                           if token.type == "heading_open" and token.tag == "h4"]
@@ -373,9 +376,9 @@ class FeedbackTests(unittest.TestCase):
         for result in ({"status": "pass"},
                        {"status": "no_match", "recommendation": {"status": "not_applicable"}}):
             with self.subTest(result=result):
-                self.assertIn("提交内容规范性检查：通过", compliance.format_compliance_check(result))
+                self.assertIn("提交内容规范性检查：通过", compliance_comment.format_compliance_check(result))
         with self.assertRaises(IssueProcessingError):
-            compliance.format_compliance_check({"status": "template_error"})
+            compliance_comment.format_compliance_check({"status": "template_error"})
 
     def test_external_template_placeholders_do_not_expand_inserted_content(self):
         """验证插入内容中的占位符不会再次展开，模板名称仍正确转义。
@@ -388,7 +391,7 @@ class FeedbackTests(unittest.TestCase):
         template = {**TEMPLATE, "name": "Documentation|文档反馈",
                     "title": "[Documentation|文档反馈]: {number} $name"}
         recommendation = {**SUGGESTION, "template": template["name"], "reason": "请填写文档链接。"}
-        comment = compliance.format_compliance_check({"status": "no_match", "recommendation": recommendation}, templates=[template])
+        comment = compliance_comment.format_compliance_check({"status": "no_match", "recommendation": recommendation}, templates=[template])
         self.assertIn(r"#### 模板推荐：Documentation\|文档反馈", comment)
         fences = [t.content for t in MarkdownIt("commonmark").parse(comment) if t.type == "fence"]
         self.assertEqual(fences[0], template["title"] + "\n")
@@ -407,7 +410,7 @@ class FeedbackTests(unittest.TestCase):
                 self.comment(result)
             self.assertTrue(raised.exception.retryable)
         with self.assertRaises(IssueProcessingError) as raised:
-            compliance.format_compliance_check({"status": "unknown"})
+            compliance_comment.format_compliance_check({"status": "unknown"})
         self.assertTrue(raised.exception.retryable)
 
     def test_malformed_structured_results_cannot_pass(self):

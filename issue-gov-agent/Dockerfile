@@ -16,12 +16,9 @@ RUN apt-get update \
 COPY issue-gov-agent/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY common /opt/common
-COPY issue-gov-agent/pyproject.toml /app/pyproject.toml
+COPY --chown=app:app common /app/common
 COPY --chown=app:app issue-gov-agent/issue_gov /app/issue_gov
 COPY --chown=app:app issue-gov-agent/config /app/config
-RUN pip install --no-cache-dir --no-deps -e /opt/common \
-    && pip install --no-cache-dir --no-deps -e /app
 USER app
 
 FROM base AS receiver

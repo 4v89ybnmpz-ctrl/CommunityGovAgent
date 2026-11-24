@@ -7,9 +7,12 @@ from typing import Any
 
 import yaml
 
-from govcommon.errors import ProcessingError
+from common.errors import ProcessingError
 from issue_gov.checks.base import COMPLIANCE, is_default_checks
-import issue_gov.checks.compliance.implementation as compliance
+import issue_gov.checks.tools.compliance.check as compliance_check
+import issue_gov.checks.tools.compliance.comment as compliance_comment
+import issue_gov.checks.tools.compliance.parse as compliance_parse
+import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 
 LOG = logging.getLogger("issue-gov-webhook")
 
@@ -44,12 +47,12 @@ def _recommend(
     配置缺失立即失败，不占用重试间隔。全部密钥失败后标记 keys_exhausted，不再按任务级重试。
     """
     if not agent_api_keys:
-        return compliance.recommend_template(title, body, templates, agent_api_key, model, base_url)
+        return compliance_recommend.recommend_template(title, body, templates, agent_api_key, model, base_url)
     last: ProcessingError | None = None
     for index, key in enumerate(agent_api_keys, start=1):
         for attempt in range(retries + 1):
             try:
-                return compliance.recommend_template(title, body, templates, key, model, base_url)
+                return compliance_recommend.recommend_template(title, body, templates, key, model, base_url)
             except ProcessingError as exc:
                 if "未配置" in str(exc):
                     raise
@@ -84,7 +87,7 @@ def analyze_issue(
                                   "message": "未找到可用的 YAML 或 Markdown Issue 模板，请添加模板或检查组织公共模板配置。"})
     for file in template_files:
         try:
-            templates.append(compliance.parse_template(file["content"], file["filename"]))
+            templates.append(compliance_parse.parse_template(file["content"], file["filename"]))
         except yaml.YAMLError:
             template_problems.append({"source": file["source"],
                                       "message": "YAML 语法无效，请检查缩进、引号、括号及标签。"})
@@ -93,7 +96,7 @@ def analyze_issue(
     if template_problems:
         result = {"status": "template_error", "template_problems": template_problems}
     else:
-        result = compliance.check_issue(title, body, templates)
+        result = compliance_check.check_issue(title, body, templates)
     if result["status"] == "no_match":
         result["recommendation"] = _recommend(
             title, body, templates, agent_api_key, model, base_url,
@@ -117,7 +120,7 @@ def analyze_issue(
     publish_comment = should_publish_comment(summary, previously_commented=previously_commented)
     comment = ""
     if publish_comment:
-        comment = compliance.format_compliance_check(result, templates=templates)
+        comment = compliance_comment.format_compliance_check(result, templates=templates)
 
     return {
         "summary": summary,

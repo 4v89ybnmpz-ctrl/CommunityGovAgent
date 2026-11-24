@@ -9,10 +9,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import yaml
-import govcommon.atomgit as atomgit
-from govcommon.errors import IssueProcessingError
+import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 common
+import common.atomgit as atomgit
+from common.errors import IssueProcessingError
 import issue_gov.worker as worker
-import issue_gov.checks.compliance.implementation as compliance
+import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 import issue_gov.receiver as receiver
 
 TEMPLATE = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
@@ -142,7 +143,7 @@ class WorkerTests(unittest.TestCase):
                 responses[2] = [{"type": "file", "name": filename}]
                 responses[3] = {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
                 with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, patch.object(
-                        compliance, "recommend_template", return_value={"status": "recommended",
+                        compliance_recommend, "recommend_template", return_value={"status": "recommended",
                             "template": "question", "reason": "适合描述当前问题"}) as model:
                     result = worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
                 self.assertEqual(result["status"], status)
@@ -186,7 +187,7 @@ class WorkerTests(unittest.TestCase):
                     responses = self.responses()
                     responses[3] = {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
                 with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, patch.object(
-                        compliance, "recommend_template") as model:
+                        compliance_recommend, "recommend_template") as model:
                     client = atomgit.AtomGit(self.config.token, request_interval=0)
                     self.assertTrue(worker.process_one(self.config, client=client))
                     self.assertFalse(worker.process_one(self.config, client=client))
@@ -261,7 +262,7 @@ class WorkerTests(unittest.TestCase):
         issue = {**ISSUE, "title": "启动失败", "body": "崩溃了"}
         recommendation = {"status": "recommended", "template": "缺陷反馈", "reason": "运行异常"}
         with patch.object(atomgit.AtomGit, "request", side_effect=self.responses(issue)) as api, patch.object(
-            compliance, "recommend_template", return_value=recommendation) as model:
+            compliance_recommend, "recommend_template", return_value=recommendation) as model:
             result = worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertEqual(model.call_args.args[-3:], ("model-key", "custom-model", "https://models.example"))
         self.assertEqual(result["recommendation_status"], "recommended")
@@ -279,7 +280,7 @@ class WorkerTests(unittest.TestCase):
         responses[3] = {"encoding": "base64", "content": base64.b64encode(
             yaml.safe_dump(documentation).encode()).decode()}
         with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, patch.object(
-            compliance, "recommend_template", return_value={"status": "not_applicable", "reason": "没有适合的模板",
+            compliance_recommend, "recommend_template", return_value={"status": "not_applicable", "reason": "没有适合的模板",
                 "maintainer": "现有模板仅覆盖文档，建议新增工具缺陷反馈模板，收集问题描述和复现步骤。"},
         ) as model:
             result = worker._process_issue(self.config, "example/repo", 12,
@@ -311,7 +312,7 @@ class WorkerTests(unittest.TestCase):
                           "maintainer": "建议新增成员申请模板，收集申请账号。"}
         client = atomgit.AtomGit(config.token, request_interval=0)
         with patch.object(client, "request", side_effect=self.responses(issue)[:-1] * 3) as api, patch.object(
-                compliance, "recommend_template", return_value=recommendation):
+                compliance_recommend, "recommend_template", return_value=recommendation):
             for repository in repositories:
                 worker._process_issue(config, repository, 12, client=client)
         self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
@@ -330,7 +331,7 @@ class WorkerTests(unittest.TestCase):
             None；通过断言验证上述行为，结果不符时测试失败。
         """
         issue = {**ISSUE, "body": ""}
-        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses(issue)), patch.object(compliance, "recommend_template") as model:
+        with patch.object(atomgit.AtomGit, "request", side_effect=self.responses(issue)), patch.object(compliance_recommend, "recommend_template") as model:
             self.assertEqual(worker._process_issue(self.config, "example/repo", 12, client=atomgit.AtomGit(self.config.token, request_interval=0))["status"], "partial_match")
         model.assert_not_called()
 
@@ -456,12 +457,12 @@ class WorkerTests(unittest.TestCase):
                 client = atomgit.AtomGit(config.token, request_interval=0)
                 with patch.object(client, "request", return_value=issue), patch.object(client, "templates", return_value=files), patch.object(
                         client, "create_comment", return_value="created") as publish, patch.object(
-                        compliance.subprocess, "Popen") as popen, patch.object(compliance.os, "killpg"):
+                        compliance_recommend.subprocess, "Popen") as popen, patch.object(compliance_recommend.os, "killpg"):
                     process = popen.return_value.__enter__.return_value
                     process.returncode = 0
                     process.communicate.return_value = ("not JSON", "model-key platform-key")
                     if failure == "timeout":
-                        process.communicate.side_effect = compliance.subprocess.TimeoutExpired("claude", compliance.LLM_TIMEOUT)
+                        process.communicate.side_effect = compliance_recommend.subprocess.TimeoutExpired("claude", compliance_recommend.LLM_TIMEOUT)
                     elif failure == "startup":
                         popen.side_effect = OSError("model-key platform-key")
                     with self.assertLogs(worker.LOG, level="WARNING") as logs:
@@ -534,7 +535,7 @@ class WorkerTests(unittest.TestCase):
         responses = self.responses(issue)
         responses[3] = {"encoding": "base64", "content": base64.b64encode(path.read_bytes()).decode()}
         with patch.object(atomgit.AtomGit, "request", side_effect=responses) as api, \
-                patch.object(compliance, "recommend_template") as model:
+                patch.object(compliance_recommend, "recommend_template") as model:
             result = worker._process_issue(self.config, "example/repo", 35, client=atomgit.AtomGit(self.config.token, request_interval=0))
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["comment_action"], "suppressed")

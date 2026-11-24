@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# 容器运维入口。环境文件是 issue-gov-agent/.env，不要在仓库根目录另建 .env。
+#
+#   scripts/service up [传给 compose up 的额外参数]
+#   scripts/service status
+#   scripts/service scale 副本数
+#   scripts/service retry
+#   scripts/service compose <docker compose 参数>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$ROOT/issue-gov-agent/.env"
+
+usage() {
+  echo "用法：scripts/service up|status|scale 副本数|retry|compose <docker compose 参数>" >&2
+}
+
+compose() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "未找到 docker，请先安装 Docker Engine 与 Compose 插件。" >&2
+    exit 1
+  fi
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "缺少 issue-gov-agent/.env。请先在 issue-gov-agent 目录执行 manage.py init。" >&2
+    exit 1
+  fi
+  cd "$ROOT"
+  docker compose --env-file "$ENV_FILE" "$@"
+}
+
+webhook_port() {
+  local port
+  port="$(grep -E '^WEBHOOK_PORT=' "$ENV_FILE" | tail -n 1 | cut -d= -f2- | tr -d '"' || true)"
+  if [[ -z "$port" ]]; then
+    port=7000
+  fi
+  printf '%s' "$port"
+}
+
+cmd="${1:-}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$cmd" in
+  up)
+    cd "$ROOT"
+    if [[ ! -f issue-gov-agent/.env || ! -f issue-gov-agent/repository.yml ]]; then
+      if [[ -x issue-gov-agent/.venv/bin/python ]]; then
+        PYTHON=issue-gov-agent/.venv/bin/python
+      else
+        PYTHON=python3
+      fi
+      (cd issue-gov-agent && "$PYTHON" manage.py init)
+      echo "已生成 issue-gov-agent/.env 和 repository.yml。"
+      echo "请填写令牌、模型配置和接入仓库后重新执行 scripts/service up。"
+      exit 1
+    fi
+    compose up -d --build "$@"
+    echo "等待接收服务就绪..."
+    PORT="$(webhook_port)"
+    python3 - "$PORT" <<'PY'
+import sys, time, urllib.request
+port = sys.argv[1]
+deadline = time.time() + 90
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/ready", timeout=3) as response:
+            if response.status == 200:
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(2)
+print("接收服务未在 90 秒内就绪。查看日志：scripts/service compose logs --tail=80 receiver", file=sys.stderr)
+raise SystemExit(1)
+PY
+    compose ps
+    echo "接收地址：http://127.0.0.1:${PORT}/webhook"
+    echo "扩容消费者：scripts/service scale 3"
+    ;;
+  status)
+    compose ps
+    echo
+    PORT="$(webhook_port)"
+    python3 - "$PORT" <<'PY'
+import sys, urllib.request
+port = sys.argv[1]
+for path in ("/health", "/ready"):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as response:
+        print(f"{path}：{response.read().decode()}")
+PY
+    ;;
+  scale)
+    if [[ $# -ne 1 || ! "$1" =~ ^[1-9][0-9]*$ ]]; then
+      echo "用法：scripts/service scale 副本数" >&2
+      exit 1
+    fi
+    compose up -d --scale "consumer=$1" --no-deps
+    compose ps consumer
+    ;;
+  retry)
+    compose exec -T consumer python -m issue_gov.worker --retry-failed
+    ;;
+  compose)
+    if [[ $# -eq 0 ]]; then
+      usage
+      exit 1
+    fi
+    compose "$@"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

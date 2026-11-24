@@ -4,7 +4,7 @@ import importlib
 import pkgutil
 from typing import Any
 
-from govcommon.errors import ProcessingError
+from common.errors import ProcessingError
 from issue_gov.checks.base import CheckTask
 
 _TOOLS: dict[str, Any] = {}

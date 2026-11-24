@@ -16,11 +16,12 @@ import sys
 import threading
 import time
 
-from govcommon.atomgit import AtomGit
-from govcommon.errors import IssueProcessingError
+from common.atomgit import AtomGit
+from common.errors import IssueProcessingError
+from common.store import connect, initialize
 from issue_gov.analysis import run_checks as analyze_issue
 from issue_gov.queues import ISSUE_ANALYSIS
-from issue_gov.receiver import Config, connect, initialize
+from issue_gov.settings import Config
 
 LOG = logging.getLogger("issue-gov-webhook")
 MAX_ATTEMPTS = 5  # 每个事件最多完成 5 次处理尝试；进程中断不消耗次数
@@ -535,8 +536,8 @@ def republish_due(config: Config) -> int:
     """把到期的重试任务重新投递到分析队列。仅服务模式使用。"""
     if not config.database_url or not config.rabbitmq_url:
         return 0
-    from govcommon.pgstore import claim_due
-    from govcommon.queueing import QueuePublishError, publish_analysis_task
+    from common.pgstore import claim_due
+    from common.queueing import QueuePublishError, publish_analysis_task
     from issue_gov.checks.base import default_checks, parse_checks
 
     try:
@@ -599,7 +600,7 @@ def _serve_health(stop: threading.Event) -> None:
 
 def run_queue_consumer(config: Config) -> None:
     """按竞争消费者处理队列中的分析任务，直到收到停止信号。"""
-    from govcommon.queueing import consume
+    from common.queueing import consume
 
     keys = tuple(key for key in config.agent_api_keys if key)
     if not keys and config.agent_api_key:

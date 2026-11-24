@@ -10,10 +10,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import govcommon.atomgit as atomgit
+import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 common
+import common.atomgit as atomgit
 import issue_gov.receiver as receiver
 import issue_gov.worker as worker
-from govcommon.errors import IssueProcessingError
+from common.errors import IssueProcessingError
 
 
 class DeliveryTests(unittest.TestCase):

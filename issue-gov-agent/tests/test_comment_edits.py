@@ -10,11 +10,11 @@ import unittest
 from unittest.mock import patch
 
 import issue_gov.analysis as analysis
-import issue_gov.checks.compliance.implementation as compliance
-import govcommon.atomgit as atomgit
+import issue_gov.checks.tools.compliance.recommend as compliance_recommend
+import common.atomgit as atomgit
 import issue_gov.receiver as receiver
 import issue_gov.worker as worker
-from govcommon.errors import IssueProcessingError
+from common.errors import IssueProcessingError
 
 
 class CommentEditTests(unittest.TestCase):
@@ -153,7 +153,7 @@ class CommentEditTests(unittest.TestCase):
             self.assertIn('提交内容规范性检查：通过', self.comments[1]['body'])
             self.edit(200, 'gap')
             self.issue['title'] = '权限申请'
-            with patch.object(compliance, 'recommend_template', return_value={
+            with patch.object(compliance_recommend, 'recommend_template', return_value={
                     'status': 'not_applicable', 'reason': '模板未覆盖权限申请',
                     'maintainer': '建议新增权限申请模板'}):
                 self.assertEqual(self.process()['comment_action'], 'updated')

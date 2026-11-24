@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from govcommon.errors import ProcessingError
+from common.errors import ProcessingError
 from issue_gov.checks.base import parse_checks
 from issue_gov.checks.registry import run_tasks
 from issue_gov.checks.tools.compliance.run import analyze_issue, should_publish_comment

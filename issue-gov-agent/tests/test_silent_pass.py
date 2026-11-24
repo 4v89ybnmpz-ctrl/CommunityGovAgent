@@ -9,11 +9,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import govcommon.atomgit as atomgit
-import issue_gov.checks.compliance.implementation as compliance
+import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 common
+import common.atomgit as atomgit
+import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 import issue_gov.receiver as receiver
 import issue_gov.worker as worker
-from govcommon.errors import IssueProcessingError
+from common.errors import IssueProcessingError
 
 TEMPLATE_FILE = {"filename": "bug.md", "source": "example/repo/.gitcode/ISSUE_TEMPLATE/bug.md",
                  "content": '---\nname: 缺陷反馈\ntitle: "[Bug] "\n---\n### 问题描述\n请填写'}
@@ -39,7 +40,7 @@ class SilentPassTests(unittest.TestCase):
         self.templates = self.enterContext(patch.object(self.client, "templates", return_value=[deepcopy(TEMPLATE_FILE)]))
         self.publish = self.enterContext(patch.object(self.client, "create_comment", side_effect=AssertionError("Passing checks must not post")))
         self.lookup = self.enterContext(patch.object(self.client, "has_comment", side_effect=AssertionError("No pending comment lookup")))
-        self.recommend = self.enterContext(patch.object(compliance, "recommend_template", return_value=deepcopy(GAP)))
+        self.recommend = self.enterContext(patch.object(compliance_recommend, "recommend_template", return_value=deepcopy(GAP)))
         self.enterContext(patch.object(atomgit, "build_opener", side_effect=AssertionError("No live network")))
 
     def rows(self, table):

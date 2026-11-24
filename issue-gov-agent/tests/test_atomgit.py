@@ -10,8 +10,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 import yaml
 
-import govcommon.atomgit as atomgit
-from govcommon.errors import IssueProcessingError
+import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 common
+import common.atomgit as atomgit
+from common.errors import IssueProcessingError
 
 TEMPLATE = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
     {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}}]}

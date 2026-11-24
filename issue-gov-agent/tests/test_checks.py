@@ -5,7 +5,8 @@ import sys
 import unittest
 
 
-from govcommon.errors import IssueProcessingError
+import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 common
+from common.errors import IssueProcessingError
 from issue_gov.analysis import CheckContext, run_checks
 from issue_gov.checks.base import default_checks, is_default_checks, parse_checks
 from issue_gov.checks.tools.compliance.run import ComplianceTool

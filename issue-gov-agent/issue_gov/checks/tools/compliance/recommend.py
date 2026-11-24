@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from typing import Any
 
-from govcommon.errors import ProcessingError
+from common.errors import ProcessingError
 from issue_gov.checks.tools.compliance.parse import _fields
 from issue_gov.checks.tools.compliance.rules import RECOMMEND_PROMPT
 

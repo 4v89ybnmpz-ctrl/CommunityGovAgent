@@ -13,8 +13,8 @@ from unittest.mock import Mock, patch
 
 import issue_gov.receiver as receiver
 import issue_gov.worker as worker
-import govcommon.atomgit as atomgit
-from govcommon.errors import IssueProcessingError
+import common.atomgit as atomgit
+from common.errors import IssueProcessingError
 
 RESULT = {"status": "pass", "comment_action": "created"}
 

@@ -11,11 +11,14 @@ import unittest
 from unittest.mock import patch
 
 import issue_gov.analysis as analysis
-import issue_gov.checks.compliance.implementation as compliance
+import issue_gov.checks.tools.compliance.check as compliance_check
+import issue_gov.checks.tools.compliance.comment as compliance_comment
+import issue_gov.checks.tools.compliance.parse as compliance_parse
+import issue_gov.checks.tools.compliance.recommend as compliance_recommend
 import issue_gov.checks.tools.compliance.run as compliance_tool
 import issue_gov.receiver as receiver
 import issue_gov.worker as worker
-from govcommon.errors import IssueProcessingError
+from common.errors import IssueProcessingError
 
 RESULT = {"status": "pass", "comment_action": "suppressed"}
 
@@ -106,7 +109,7 @@ class KeyFailoverTests(unittest.TestCase):
             calls.append(key)
             raise IssueProcessingError("模型响应超时")
 
-        with patch.object(compliance, "recommend_template", side_effect=fail), patch.object(
+        with patch.object(compliance_recommend, "recommend_template", side_effect=fail), patch.object(
                 compliance_tool.time, "sleep", side_effect=sleeps.append):
             with self.assertRaises(IssueProcessingError) as raised:
                 compliance_tool._recommend("未知", "正文", [], "ignored", "model", "https://models.example",
@@ -128,11 +131,11 @@ class KeyFailoverTests(unittest.TestCase):
 
         template = {"name": "缺陷", "title": "[Bug] ", "body": [
             {"type": "textarea", "attributes": {"label": "问题描述"}, "validations": {"required": True}}]}
-        with patch.object(compliance, "parse_template", return_value=template), patch.object(
-                compliance, "check_issue", return_value={"status": "no_match", "matched_templates": [], "checks": []}), \
-                patch.object(compliance, "recommend_template", side_effect=recommend), patch.object(
+        with patch.object(compliance_parse, "parse_template", return_value=template), patch.object(
+                compliance_check, "check_issue", return_value={"status": "no_match", "matched_templates": [], "checks": []}), \
+                patch.object(compliance_recommend, "recommend_template", side_effect=recommend), patch.object(
                 compliance_tool.time, "sleep") as pause, patch.object(
-                compliance, "format_compliance_check", return_value="评论"):
+                compliance_comment, "format_compliance_check", return_value="评论"):
             result = analysis.analyze_issue(
                 "未知", "正文", [{"filename": "a.yml", "source": "s", "content": "x"}],
                 "ignored", repository="example/project", number=2,
@@ -142,7 +145,7 @@ class KeyFailoverTests(unittest.TestCase):
         self.assertEqual(result["summary"]["recommendation_status"], "recommended")
 
     def test_configuration_error_does_not_sleep_or_rotate(self):
-        with patch.object(compliance, "recommend_template",
+        with patch.object(compliance_recommend, "recommend_template",
                           side_effect=IssueProcessingError("未配置 LLM_BASE_URL 或 LLM_MODEL")) as recommend, \
                 patch.object(compliance_tool.time, "sleep") as pause:
             with self.assertRaises(IssueProcessingError) as raised:

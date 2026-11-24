@@ -8,8 +8,11 @@ import yaml
 from unittest.mock import patch
 
 import issue_gov.analysis as analysis
-import issue_gov.checks.compliance.implementation as compliance
-from govcommon.errors import IssueProcessingError
+import issue_gov.checks.tools.compliance.check as compliance_check
+import issue_gov.checks.tools.compliance.comment as compliance_comment
+import issue_gov.checks.tools.compliance.parse as compliance_parse
+import issue_gov.checks.tools.compliance.recommend as compliance_recommend
+from common.errors import IssueProcessingError
 
 TEMPLATE = {"name": "缺陷反馈", "title": "[Bug] ", "body": [
     {"type": "textarea", "attributes": {"label": "问题描述"},
@@ -30,9 +33,9 @@ class AnalysisTests(unittest.TestCase):
         """
         for title, body, status in (("[Bug] 启动失败", "### 问题描述\n启动失败", "pass"),
                                     ("权限申请", "申请访问仓库", "no_match")):
-            with self.subTest(status=status), patch.object(compliance, "recommend_template", return_value={
+            with self.subTest(status=status), patch.object(compliance_recommend, "recommend_template", return_value={
                     "status": "not_applicable", "reason": "模板未覆盖权限申请", "maintainer": "建议新增权限申请模板"}), patch.object(
-                    compliance, "format_compliance_check", wraps=compliance.format_compliance_check) as format_check:
+                    compliance_comment, "format_compliance_check", wraps=compliance_comment.format_compliance_check) as format_check:
                 result = analysis.analyze_issue(title, body, [TEMPLATE_FILE], "key",
                                                 repository="example/repo", number=18, previously_commented=True)
             self.assertEqual(result["summary"]["status"], status)
@@ -51,7 +54,7 @@ class AnalysisTests(unittest.TestCase):
             None；验证两种匹配状态均不会触发模型调用。
         """
         for body, status in (("### 问题描述\n启动失败", "pass"), ("缺少章节", "partial_match")):
-            with self.subTest(status=status), patch.object(compliance, "recommend_template") as recommend:
+            with self.subTest(status=status), patch.object(compliance_recommend, "recommend_template") as recommend:
                 result = analysis.analyze_issue("[Bug] 启动失败", body, [TEMPLATE_FILE], "key",
                                                 repository="example/repo", number=18)
                 self.assertEqual(result["summary"], {"status": status, "recommendation_status": None})
@@ -73,7 +76,7 @@ class AnalysisTests(unittest.TestCase):
                              ('### Runtime environment / 环境信息：\n', 'partial_match'),
                              ('### ENVIRONMENT:\n', 'partial_match'),
                              ('### 运行环境\nLinux', 'partial_match')):
-            with self.subTest(body=body), patch.object(compliance, 'recommend_template') as recommend:
+            with self.subTest(body=body), patch.object(compliance_recommend, 'recommend_template') as recommend:
                 result = analysis.analyze_issue('[Bug] 错误', body, [file], '',
                                                 repository='example/repo', number=18)
                 self.assertEqual(result['summary'], {'status': status, 'recommendation_status': None})
@@ -88,7 +91,7 @@ class AnalysisTests(unittest.TestCase):
         for body, status in (('### 日志 / 结果\n错误输出', 'pass'),
                              ('### Related log / 日志\n错误输出', 'pass'),
                              ('### 日志\n', 'partial_match'), ('缺少章节', 'partial_match')):
-            with self.subTest(body=body), patch.object(compliance, 'recommend_template') as recommend:
+            with self.subTest(body=body), patch.object(compliance_recommend, 'recommend_template') as recommend:
                 result = analysis.analyze_issue('[Bug] 错误', body, [file], '',
                                                 repository='example/repo', number=18)
                 self.assertEqual(result['summary'], {'status': status, 'recommendation_status': None})
@@ -109,7 +112,7 @@ class AnalysisTests(unittest.TestCase):
                               "建议新增申请模板，收集申请账号。"
                               if status == "not_applicable" else None)}
             with self.subTest(status=status), patch.object(
-                    compliance, "recommend_template", return_value=suggestion) as recommend:
+                    compliance_recommend, "recommend_template", return_value=suggestion) as recommend:
                 result = analysis.analyze_issue("启动失败", "退出了", [TEMPLATE_FILE], "key", "model", "https://model.example",
                                                 repository="example/repo", number=18, maintainers=("alice",))
                 self.assertEqual(result["summary"], {"status": "no_match", "recommendation_status": status})
@@ -146,7 +149,7 @@ class AnalysisTests(unittest.TestCase):
                 '### 涉及文档路径或链接\ndocs/robot/robot使用指南.md\n'
                 '### 问题描述\n/approve 权限说明与治理文档不一致\n'
                 '### 期望内容\n按 PR 类型明确审批人权限')
-        with patch.object(compliance, 'recommend_template') as recommend:
+        with patch.object(compliance_recommend, 'recommend_template') as recommend:
             result = analysis.analyze_issue('[文档]: /approve 权限说明不一致', body, [file], '',
                                             repository='qiurq1/issue-gov-test2', number=9)
         self.assertEqual(result['summary']['status'], 'pass')
@@ -163,8 +166,8 @@ class AnalysisTests(unittest.TestCase):
         Returns:
             None；核对错误可重试且评论生成函数未执行。
         """
-        with patch.object(compliance, "recommend_template", side_effect=IssueProcessingError("模型响应超时")), patch.object(
-                compliance, "format_compliance_check") as format_check:
+        with patch.object(compliance_recommend, "recommend_template", side_effect=IssueProcessingError("模型响应超时")), patch.object(
+                compliance_comment, "format_compliance_check") as format_check:
             with self.assertRaises(IssueProcessingError) as raised:
                 analysis.analyze_issue("未知", "正文", [TEMPLATE_FILE], "key", repository="example/repo", number=11)
         self.assertTrue(raised.exception.retryable)
@@ -178,9 +181,9 @@ class AnalysisTests(unittest.TestCase):
         Returns:
             None；验证检查章节及模板参数的传递。
         """
-        result = compliance.check_issue("[Bug] 启动失败", "缺少章节", [TEMPLATE])
+        result = compliance_check.check_issue("[Bug] 启动失败", "缺少章节", [TEMPLATE])
         section = "### 提交内容规范性检查：未通过"
-        with patch.object(compliance, "format_compliance_check", return_value=section) as format_check:
+        with patch.object(compliance_comment, "format_compliance_check", return_value=section) as format_check:
             output = analysis.analyze_issue("[Bug] 启动失败", "缺少章节", [TEMPLATE_FILE], "key",
                                             repository="example/repo", number=18, maintainers=("alice",))
         self.assertEqual(output["comment"], section)
@@ -195,8 +198,8 @@ class AnalysisTests(unittest.TestCase):
             None；核对状态、建议接收人和未调用模型或格式检查。
         """
         for maintainers in ((), ("alice", "bob")):
-            with self.subTest(maintainers=maintainers), patch.object(compliance, "recommend_template") as recommend, patch.object(
-                    compliance, "check_issue") as check:
+            with self.subTest(maintainers=maintainers), patch.object(compliance_recommend, "recommend_template") as recommend, patch.object(
+                    compliance_check, "check_issue") as check:
                 result = analysis.analyze_issue("标题", "正文", [], "key", repository="example/repo", number=18,
                                                 maintainers=maintainers, previously_commented=True)
             self.assertEqual(result["summary"], {"status": "template_error", "recommendation_status": None})
@@ -228,8 +231,8 @@ class AnalysisTests(unittest.TestCase):
             for filename, content, message in cases:
                 source = owner + "/.gitcode/ISSUE_TEMPLATE/" + filename
                 files = [TEMPLATE_FILE, {"filename": filename, "source": source, "content": content}]
-                with self.subTest(source=source, content=content), patch.object(compliance, "recommend_template") as recommend, patch.object(
-                        compliance, "check_issue") as check:
+                with self.subTest(source=source, content=content), patch.object(compliance_recommend, "recommend_template") as recommend, patch.object(
+                        compliance_check, "check_issue") as check:
                     result = analysis.analyze_issue("标题", "正文", files, "key", repository="example/repo", number=18,
                                                     maintainers=("alice",))
                 self.assertEqual(result["summary"]["status"], "template_error")
@@ -272,9 +275,9 @@ class AnalysisTests(unittest.TestCase):
         files = [TEMPLATE_FILE, {"filename": "docs.md", "source": "example/repo/.gitcode/ISSUE_TEMPLATE/docs.md",
                                 "content": '---\nname: 文档反馈\ntitle: "[Docs] "\n---\n### 文档位置\n请填写链接'}]
         original = deepcopy(files)
-        parsed = [compliance.parse_template(file["content"], file["filename"]) for file in files]
-        with patch.object(compliance, "check_issue", wraps=compliance.check_issue) as check, patch.object(
-                compliance, "recommend_template") as recommend:
+        parsed = [compliance_parse.parse_template(file["content"], file["filename"]) for file in files]
+        with patch.object(compliance_check, "check_issue", wraps=compliance_check.check_issue) as check, patch.object(
+                compliance_recommend, "recommend_template") as recommend:
             result = analysis.analyze_issue("[Bug] 启动失败", "### 问题描述\n启动失败", files, "key",
                                             repository="example/repo", number=18)
         check.assert_called_once_with("[Bug] 启动失败", "### 问题描述\n启动失败", parsed)

@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from govcommon.errors import IssueProcessingError
+from .errors import IssueProcessingError
 
 API_URL = "https://api.atomgit.com/api/v5"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024

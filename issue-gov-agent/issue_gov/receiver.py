@@ -1,28 +1,26 @@
-"""AtomGit Issue Webhook 接收入口及共用的配置、数据库函数。
+"""AtomGit Issue Webhook 接收入口。数据库会话在 common.store。
 
 主机上的日常操作仍使用 manage.py，由 Supervisor 加载 create_app()。
 容器入口是本文件的 main()，直接启动 Gunicorn，不经过 Supervisor。
 配置了 SERVICE_MODE=queue 时，校验通过的任务写入 PostgreSQL 并投递到消息队列。
 """
 
-from contextlib import contextmanager
 import hashlib
 import hmac
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Any, Iterator
+from typing import Any
 
 from flask import Flask, Response, jsonify, request
 from dotenv import dotenv_values
 
-from govcommon.pgstore import DatabaseError
-from govcommon.queueing import QueuePublishError, publish_analysis_task
-from govcommon.schema import apply_sqlite
+from common.pgstore import DatabaseError
+from common.queueing import QueuePublishError, publish_analysis_task
+from common.store import connect, initialize, queue_snapshot
 import issue_gov.paths as paths
 from issue_gov.checks.base import default_checks, dump_checks
 from issue_gov.queues import ISSUE_ANALYSIS
@@ -43,7 +41,7 @@ def connect(config: Config) -> Iterator[sqlite3.Connection]:
         供 with 语句使用的数据库连接上下文管理器；进入时提供下述连接，退出时关闭连接。
     """
     if config.database_url:
-        from govcommon.pgstore import connect as pg_connect
+        from common.pgstore import connect as pg_connect
         with pg_connect(config.database_url) as db:
             yield db
         return
@@ -66,7 +64,7 @@ def initialize(config: Config) -> None:
     """
 
     if config.database_url:
-        from govcommon.pgstore import initialize as pg_initialize
+        from common.pgstore import initialize as pg_initialize
         pg_initialize(config.database_url)
         return
 
@@ -175,7 +173,7 @@ def create_app(config: Config | None = None) -> Flask:
             with connect(config) as db:
                 db.execute("SELECT 1")
             if config.rabbitmq_url:
-                from govcommon.queueing import check
+                from common.queueing import check
                 check(config.rabbitmq_url, ISSUE_ANALYSIS)
         except (sqlite3.Error, DatabaseError, QueuePublishError):
             return jsonify(status="unavailable"), 503
@@ -295,52 +293,6 @@ def _mark_dispatching(config: Config, event_id: str) -> None:
             db.execute("UPDATE events SET state='dispatching' WHERE event_id=? AND state='queued'", (event_id,))
     except (sqlite3.Error, DatabaseError):
         LOG.error("任务已投递但状态更新失败：事件=%s", event_id[:12])
-
-
-def queue_snapshot(config: Config) -> dict[str, Any]:
-    """只读查询各仓库的任务统计和最近五条任务，不创建或修改数据库。
-
-    Args:
-        config: 包含任务数据库路径的服务配置。
-    Returns:
-        database 为绝对路径，exists 表示文件存在；counts 为按仓库及状态分组的
-        数量，recent 为最近五条任务。文件尚不存在时两个列表为空。
-        服务模式改为查询 PostgreSQL，database 为去掉密码的连接串。
-    """
-    if config.database_url:
-        from govcommon.queueing import redact_url
-        snapshot = {"database": redact_url(config.database_url), "exists": True,
-                    "counts": [], "recent": []}
-        try:
-            with connect(config) as db:
-                snapshot["counts"] = [dict(row) for row in db.execute(
-                    "SELECT repository, state, COUNT(*) AS count FROM events "
-                    "GROUP BY repository, state ORDER BY repository, state").fetchall()]
-                snapshot["recent"] = [dict(row) for row in db.execute(
-                    "SELECT repository, issue_number, state, attempts, updated_at, last_error, result "
-                    "FROM events ORDER BY updated_at DESC, event_id LIMIT 5").fetchall()]
-        except DatabaseError:
-            snapshot["exists"] = False
-        return snapshot
-    path = Path(config.database).resolve()
-    snapshot: dict[str, Any] = {"database": str(path), "exists": path.is_file(),
-                                "counts": [], "recent": []}
-    if not snapshot["exists"]:
-        return snapshot
-    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10)
-    db.row_factory = sqlite3.Row
-    try:
-        with db:
-            db.execute("BEGIN")
-            snapshot["counts"] = [dict(row) for row in db.execute(
-                "SELECT repository, state, COUNT(*) AS count FROM events "
-                "GROUP BY repository, state ORDER BY repository, state")]
-            snapshot["recent"] = [dict(row) for row in db.execute(
-                "SELECT repository, issue_number, state, attempts, updated_at, last_error, result "
-                "FROM events ORDER BY updated_at DESC, event_id LIMIT 5")]
-    finally:
-        db.close()
-    return snapshot
 
 
 def listen_port() -> int:

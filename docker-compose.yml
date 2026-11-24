@@ -1,7 +1,7 @@
 # 接收服务、消费者、PostgreSQL 和 RabbitMQ。
-# 唯一的环境文件是 issue-gov-agent/.env。请用 scripts/compose 启动，它会把该文件传给 Compose。
+# 唯一的环境文件是 issue-gov-agent/.env。请用 scripts/service 启动，它会把该文件传给 Compose。
 # 容器进程只额外设置 SERVICE_MODE=queue；服务用这份文件里的账号和口令拼出连接串。
-# 消费者数量：scripts/compose up -d --scale consumer=3
+# 消费者数量：scripts/service scale 3
 
 name: issue-gov
 

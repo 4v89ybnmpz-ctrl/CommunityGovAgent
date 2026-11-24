@@ -2,7 +2,7 @@
 """验证接收服务、消息队列和多个消费者在并发下只处理一次，并检查死信。
 
 默认读取 issue-gov-agent/.env 里的连接串，把主机改到本机映射端口，并使用独立验证库。
-不调用 AtomGit 或模型。先启动基础设施：scripts/compose up -d postgres rabbitmq
+不调用 AtomGit 或模型。先启动基础设施：scripts/service compose up -d postgres rabbitmq
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -73,10 +73,13 @@ def _apply_runtime_urls() -> None:
 os.environ["SERVICE_MODE"] = "queue"
 _apply_runtime_urls()
 
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "issue-gov-agent"))
+
 import issue_gov.receiver as receiver
 import issue_gov.worker as worker
-from govcommon.errors import IssueProcessingError
-from govcommon.queueing import consume, dead_letter_count
+from common.errors import IssueProcessingError
+from common.queueing import consume, dead_letter_count
 from issue_gov.queues import ISSUE_ANALYSIS
 
 
@@ -101,14 +104,14 @@ def prepare_database() -> None:
             if exists is None:
                 connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
     except psycopg.Error as exc:
-        print(f"数据库不可用：{exc.__class__.__name__}。请先执行 scripts/compose up -d postgres rabbitmq", file=sys.stderr)
+        print(f"数据库不可用：{exc.__class__.__name__}。请先执行 scripts/service compose up -d postgres rabbitmq", file=sys.stderr)
         raise SystemExit(1) from None
 
 
 def assert_queue_idle() -> None:
     """拒绝在已有正式消费者时清空队列。验证开始前清掉残留消息。"""
     import pika
-    from govcommon.queueing import _parameters, declare
+    from common.queueing import _parameters, declare
 
     connection = pika.BlockingConnection(_parameters(os.environ["RABBITMQ_URL"]))
     try:
@@ -158,7 +161,7 @@ def main() -> None:
     try:
         receiver.initialize(config)
     except receiver.DatabaseError as exc:
-        print(f"数据库不可用：{exc}。请先执行 scripts/compose up -d postgres rabbitmq", file=sys.stderr)
+        print(f"数据库不可用：{exc}。请先执行 scripts/service compose up -d postgres rabbitmq", file=sys.stderr)
         raise SystemExit(1) from None
     with receiver.connect(config) as db:
         db.execute("DELETE FROM reports")

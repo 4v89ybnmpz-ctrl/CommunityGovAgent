@@ -18,7 +18,7 @@
 
 ```text
 community-gov-agent/
-├── common/govcommon/          # 队列、数据库、AtomGit 客户端，供后续 pr-gov-agent 共用
+├── common/                    # 队列、数据库、AtomGit 客户端，供后续 pr-gov-agent 共用
 └── issue-gov-agent/
     ├── .env                   # 环境配置，与代码同级，不提交
     ├── repository.yml         # 接入仓库及维护者
@@ -63,10 +63,9 @@ fi
 ```bash
 cd issue-gov-agent
 
-# 安装 Python 依赖，并把本仓库的 govcommon、issue_gov 装进虚拟环境
+# 只安装第三方依赖。本仓库代码按目录导入，不需要安装成包
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m pip install --no-deps -e ../common -e .
 
 # 可选：仅缺少 Claude Code 且需要准备 Node.js/npm 时执行本段
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"

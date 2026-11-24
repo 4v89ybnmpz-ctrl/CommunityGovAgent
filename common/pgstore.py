@@ -1,4 +1,4 @@
-"""PostgreSQL 存储：服务化部署中的独立数据库。SQLite 路径仍由 receiver 保持原样。"""
+"""PostgreSQL 存储。SQLite 与这里的切换在 store.py。"""
 
 from contextlib import contextmanager
 from typing import Iterator
@@ -131,8 +131,8 @@ def initialize(database_url: str) -> None:
 
 
 def _schema(connection) -> None:
-    """写入当前版本的表结构。语句集中在 govcommon.schema。"""
-    from govcommon.schema import apply_postgres
+    """写入当前版本的表结构。语句集中在 schema 模块。"""
+    from .schema import apply_postgres
     apply_postgres(connection)
 
 
