@@ -1,5 +1,7 @@
 # 容器部署
 
+本机两套服务并存时的边界、灰度入口和接手步骤见 [HANDOFF.md](HANDOFF.md)。
+
 接收服务、分析消费者、PostgreSQL 和 RabbitMQ 由仓库根目录的 `docker-compose.yml` 一起启动。检查规则、评论内容和模型推荐与原来的单机进程相同；变化的是任务如何传递和保存。
 
 `manage.py` 与 Supervisor 的启动方式保持不变，仍然使用本机 SQLite。容器不经过 Supervisor，分别执行 `receiver.py` 和 `worker.py` 里的 `main()`。
@@ -25,7 +27,7 @@ RabbitMQ
 
 同一 Issue 的新通知会把尚未完成的旧任务标为已覆盖。多个消费者同时拿到同一条消息时，只有一个能把状态从 `dispatching` 改为 `running`。处理中断后未确认的消息会重新投递；评论标记和待确认记录仍用来避免重复发评论。
 
-可重试错误（平台超时、限流等）仍按原来的次数和退避写回数据库，由消费者里的重试线程到期后再投递。模型密钥全部失败不再做任务级重试。
+可重试错误（平台超时、限流、网关 404 等）仍按原来的次数和退避写回数据库，由消费者里的重试线程到期后再投递。同一次 AtomGit 调用里，连接失败、502/503/504 和网关返回的非 JSON 404 会按客户端请求间隔再试 2 次；403、429 和接口 JSON 404 不在这一层重试。Issue 不存在时任务失败一次。模型密钥全部失败不再做任务级重试；模型结果格式不对只重试调用，不进入死信。
 
 ## 配置
 
@@ -42,7 +44,7 @@ RabbitMQ
 
 口令只写在 `POSTGRES_PASSWORD` 和 `RABBITMQ_PASSWORD`。口令只用字母和数字。`init` 会把占位符换成随机值。宿主机映射端口由 `POSTGRES_PORT`、`RABBITMQ_PORT` 和 `RABBITMQ_MANAGEMENT_PORT` 决定，且只绑定在 `127.0.0.1`，不对外网开放；远程访问数据库或管理页面请走 SSH 隧道。本机直接连接时在进程环境中设置 `DATABASE_URL` 和 `RABBITMQ_URL`，不要把这两项写进 `.env`。
 
-多个模型密钥写在 `AGENT_API_KEYS`，用英文逗号分隔。每个密钥先请求一次，失败后按 `LLM_KEY_RETRY_INTERVAL`（默认 10 秒）再试 `LLM_KEY_RETRIES` 次（默认 2 次），然后切换下一个密钥。全部失败后任务状态改为 `failed`，`dead_lettered` 为 1，消息进入 `issue.analysis.dlq`。只填写 `AGENT_API_KEY` 时，`manage.py` 仍按原来的任务级重试；容器里的消费者会对这一个密钥执行同样的两次重试，失败后进入死信队列。
+多个模型密钥写在 `AGENT_API_KEYS`，用英文逗号分隔。鉴权失败立即换下一个密钥。超时和进程启动失败先按 `LLM_KEY_RETRY_INTERVAL`（默认 10 秒）再试当前密钥 `LLM_KEY_RETRIES` 次（默认 2 次），然后切换。结果格式不对只重试这次调用，不计入密钥耗尽，任务按可重试失败回到队列。密钥本身全部失败后任务状态改为 `failed`，`dead_lettered` 为 1，消息进入 `issue.analysis.dlq`。只填写 `AGENT_API_KEY` 时，`manage.py` 仍按原来的任务级重试；容器里的消费者会对这一个密钥执行同样的分类重试，密钥失败后进入死信队列。
 
 首次生成配置：
 

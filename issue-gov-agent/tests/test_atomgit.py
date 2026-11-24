@@ -89,17 +89,81 @@ class AtomGitTests(unittest.TestCase):
         """
         for code in (302, 401, 403, 404, 408, 429, 500):
             opener = Mock()
+            body = b'{"message":"Not Found"}' if code == 404 else b"private-token"
             opener.open.side_effect = HTTPError("https://example/?private-token", code,
-                                               "private-token", {}, io.BytesIO(b'private-token'))
+                                               "private-token", {"Content-Type": "application/json"}, io.BytesIO(body))
             with patch.object(atomgit, "build_opener", return_value=opener), self.assertRaises(IssueProcessingError) as error:
                 self.client.request("GET", "/test")
             self.assertNotIn("private-token", str(error.exception))
             self.assertEqual(error.exception.retryable, code in (408, 429, 500))
+            self.assertEqual(opener.open.call_count, 1)
+        opener = Mock()
         opener.open.side_effect = URLError("private-token")
         with patch.object(atomgit, "build_opener", return_value=opener), self.assertRaises(IssueProcessingError) as error:
             self.client.request("GET", "/test")
         self.assertNotIn("private-token", str(error.exception))
+        self.assertTrue(error.exception.retryable)
+        self.assertEqual(opener.open.call_count, 3)
         self.assertIsNone(atomgit.NoRedirect().redirect_request(None, None, 302, "", {}, "https://outside"))
+
+    def test_transient_failures_retry_inside_the_same_request(self):
+        """网络抖动和 502 在同一次调用内再试，恢复后返回已读到的正文。"""
+        success = io.BytesIO(b'{"ok": true}')
+        success.status = 200
+        opener = Mock()
+        opener.open.side_effect = [URLError("reset"), success]
+        with patch.object(atomgit, "build_opener", return_value=opener):
+            self.assertEqual(self.client.request("GET", "/test"), {"ok": True})
+        self.assertEqual(opener.open.call_count, 2)
+
+        done = io.BytesIO(b'{"files": []}')
+        done.status = 200
+        opener = Mock()
+        opener.open.side_effect = [
+            HTTPError("https://example/gateway", 502, "bad gateway", {}, io.BytesIO(b"<html>")),
+            HTTPError("https://example/gateway", 503, "unavailable", {}, io.BytesIO(b"")),
+            done,
+        ]
+        with patch.object(atomgit, "build_opener", return_value=opener):
+            self.assertEqual(self.client.request("GET", "/templates"), {"files": []})
+        self.assertEqual(opener.open.call_count, 3)
+
+    def test_gateway_404_retries_and_missing_issue_does_not(self):
+        """接口 JSON 404 失败一次；HTML 或空正文的 404 短间隔再试，仍失败时任务可重试。"""
+        opener = Mock()
+        opener.open.side_effect = HTTPError(
+            "https://example/issues/1", 404, "missing",
+            {"Content-Type": "application/json"}, io.BytesIO(b'{"message":"Not Found"}'))
+        with patch.object(atomgit, "build_opener", return_value=opener), self.assertRaises(IssueProcessingError) as missing:
+            self.client.request("GET", "/repos/example/repo/issues/1")
+        self.assertFalse(missing.exception.retryable)
+        self.assertEqual(missing.exception.status_code, 404)
+        self.assertEqual(opener.open.call_count, 1)
+
+        def gateway_404(*args, **kwargs):
+            raise HTTPError(
+                "https://example/gateway", 404, "missing",
+                {"Content-Type": "text/html"}, io.BytesIO(b"<html>404</html>"))
+
+        opener = Mock()
+        opener.open.side_effect = gateway_404
+        with patch.object(atomgit, "build_opener", return_value=opener), self.assertRaises(IssueProcessingError) as gateway:
+            self.client.request("GET", "/repos/example/repo/issues/1")
+        self.assertTrue(gateway.exception.retryable)
+        self.assertEqual(gateway.exception.status_code, 404)
+        self.assertEqual(gateway.exception.failure, "gateway")
+        self.assertNotIn("html", str(gateway.exception).lower())
+        self.assertEqual(opener.open.call_count, 3)
+
+    def test_forbidden_is_not_retried(self):
+        """403 不在同一次请求里重试。"""
+        opener = Mock()
+        opener.open.side_effect = HTTPError(
+            "https://example/issues/1", 403, "forbidden", {}, io.BytesIO(b'{"message":"Forbidden"}'))
+        with patch.object(atomgit, "build_opener", return_value=opener), self.assertRaises(IssueProcessingError) as error:
+            self.client.request("GET", "/repos/example/repo/issues/1")
+        self.assertFalse(error.exception.retryable)
+        self.assertEqual(opener.open.call_count, 1)
 
     def test_unnamed_markdown_textarea_does_not_block_other_templates(self):
         """仓库读取接受真实空 label 模板，并继续加载同目录中的其他模板。
@@ -274,13 +338,24 @@ class AtomGitTests(unittest.TestCase):
         client = atomgit.AtomGit("private-token")
         opener = Mock()
         opener.open.side_effect = URLError("offline")
+        clock = {"now": 100.0}
+
+        def monotonic():
+            return clock["now"]
+
+        def sleep(seconds):
+            clock["now"] += seconds
+
         with patch.object(atomgit, "build_opener", return_value=opener), \
-                patch.object(atomgit.time, "monotonic", side_effect=[100, 100.25, 101]), \
-                patch.object(atomgit.time, "sleep") as sleep:
-            for _ in range(2):
-                with self.assertRaises(IssueProcessingError):
-                    client.request("GET", "/test")
-        sleep.assert_called_once_with(0.75)
+                patch.object(atomgit.time, "monotonic", side_effect=monotonic), \
+                patch.object(atomgit.time, "sleep", side_effect=sleep) as slept:
+            with self.assertRaises(IssueProcessingError):
+                client.request("GET", "/test")
+            self.assertEqual([item.args[0] for item in slept.call_args_list], [1.0, 1.0])
+            with self.assertRaises(IssueProcessingError):
+                client.request("GET", "/test")
+        self.assertEqual(opener.open.call_count, 6)
+        self.assertEqual([item.args[0] for item in slept.call_args_list], [1.0, 1.0, 1.0, 1.0, 1.0])
 
     def test_templates_cache_is_per_repository_expires_and_copies_values(self):
         """验证模板缓存按仓库隔离、到期刷新且返回副本。

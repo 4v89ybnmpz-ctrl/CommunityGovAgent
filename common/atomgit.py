@@ -19,6 +19,9 @@ from .errors import IssueProcessingError
 
 API_URL = "https://api.atomgit.com/api/v5"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# 同一次 HTTP 调用的额外尝试次数。网络抖动、502/503/504 和网关 404 使用。
+REQUEST_RETRIES = 2
+TRANSIENT_STATUS = frozenset({502, 503, 504})
 TEMPLATE_CACHE_SECONDS = 60
 
 
@@ -43,6 +46,35 @@ def retry_after_seconds(value: str | None) -> float:
         return max(30, seconds) if math.isfinite(seconds) else 30
     except (ValueError, TypeError, OverflowError):
         return 30
+
+
+def _retry_same_request(exc: IssueProcessingError) -> bool:
+    """同一次调用里可以立刻再试的失败：断连、网关 5xx，以及非接口正文的 404。"""
+    if exc.failure == "network" or exc.status_code in TRANSIENT_STATUS:
+        return True
+    return exc.status_code == 404 and exc.failure == "gateway"
+
+
+def _api_error_body(exc: HTTPError) -> bool:
+    """判断 404 正文是否来自平台接口。JSON 对象或数组视为 Issue 或路径不存在。"""
+    headers = exc.headers
+    content_type = ""
+    if headers is not None:
+        content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+    if "html" in content_type.lower():
+        return False
+    try:
+        raw = exc.read(4096)
+    except OSError:
+        return False
+    stripped = raw.strip()
+    if not stripped or stripped.startswith((b"<", b"<!")):
+        return False
+    try:
+        parsed = json.loads(stripped.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return False
+    return isinstance(parsed, (dict, list))
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -85,6 +117,8 @@ class AtomGit:
         """向固定 AtomGit API 地址发送请求并解析响应，将请求失败转换为可安全记录的异常。
 
         请求禁止自动重定向，等待超时为 30 秒，响应大小限制为 2 MiB。
+        网络连接失败、502/503/504 以及网关返回的非 JSON 404，在这一次调用内再试两次，
+        间隔沿用本客户端的请求间隔。403、429 和接口返回的 JSON 404 不在这里重试。
 
         Args:
             method: HTTP 方法，例如 GET、POST 或 PATCH。
@@ -94,8 +128,19 @@ class AtomGit:
             响应 JSON 对象或数组；成功响应的正文为空时返回空字典。
         Raises:
             IssueProcessingError: 网络或 HTTP 错误、响应过大、JSON 无效或响应类型不受支持；
-                retryable 属性标明是否允许自动重试。
+                retryable 属性标明是否允许任务级自动重试。
         """
+        attempt = 0
+        while True:
+            try:
+                return self._exchange(method, path, data)
+            except IssueProcessingError as exc:
+                attempt += 1
+                if attempt > REQUEST_RETRIES or not _retry_same_request(exc):
+                    raise
+
+    def _exchange(self, method: str, path: str, data):
+        """发送一次 HTTP 请求。调用方负责瞬时失败的短间隔重试。"""
         headers = {"Authorization": "Bearer " + self._token,
                    "Accept": "application/json", "Content-Type": "application/json"}
         payload = None if data is None else json.dumps(data).encode()
@@ -118,13 +163,16 @@ class AtomGit:
             code = exc.code
             # 429 限流时，尝试从响应头中解析 Retry-After，缺失或无效时默认 30 秒
             retry_after = retry_after_seconds((exc.headers or {}).get("Retry-After")) if code == 429 else 0
+            gateway = code == 404 and not _api_error_body(exc)
             exc.close()
             message = ("AtomGit 请求被限流，HTTP 429" if code == 429
                        else f"AtomGit 请求失败，HTTP {code}")
-            raise IssueProcessingError(message, code in {408, 429} or code >= 500,
-                                       status_code=code, retry_after=retry_after) from None
+            retryable = code in {408, 429} or code >= 500 or gateway
+            failure = "gateway" if code in TRANSIENT_STATUS or gateway else ""
+            raise IssueProcessingError(message, retryable, status_code=code,
+                                       retry_after=retry_after, failure=failure) from None
         except (URLError, TimeoutError, OSError):
-            raise IssueProcessingError("AtomGit 网络连接失败或超时") from None
+            raise IssueProcessingError("AtomGit 网络连接失败或超时", failure="network") from None
         except (ValueError, UnicodeError):
             raise IssueProcessingError("AtomGit 返回无效 JSON") from None
         if not isinstance(result, (dict, list)):

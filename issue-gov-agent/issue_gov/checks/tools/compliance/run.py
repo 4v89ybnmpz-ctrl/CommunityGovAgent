@@ -43,22 +43,37 @@ def _recommend(
 ) -> dict[str, Any]:
     """调用模板推荐。未提供密钥列表时保持单次调用；提供时按密钥轮换。
 
-    每个密钥先请求一次，失败后按间隔重试 retries 次。该密钥仍失败才切换下一个。
-    配置缺失立即失败，不占用重试间隔。全部密钥失败后标记 keys_exhausted，不再按任务级重试。
+    鉴权失败立即换下一个密钥。超时和进程启动失败按间隔重试当前密钥，用尽后再切换。
+    结果格式不对只重试调用，不计入密钥耗尽，也不因此进入死信。
+    配置缺失立即失败，不占用重试间隔。密钥本身全部失败后标记 keys_exhausted。
     """
     if not agent_api_keys:
         return compliance_recommend.recommend_template(title, body, templates, agent_api_key, model, base_url)
     last: ProcessingError | None = None
+    invalid_attempts = 0
     for index, key in enumerate(agent_api_keys, start=1):
-        for attempt in range(retries + 1):
+        attempt = 0
+        while True:
             try:
                 return compliance_recommend.recommend_template(title, body, templates, key, model, base_url)
             except ProcessingError as exc:
                 if "未配置" in str(exc):
                     raise
                 last = exc
+                if exc.failure == "invalid_output":
+                    invalid_attempts += 1
+                    if invalid_attempts > retries:
+                        raise ProcessingError(
+                            "模型未返回有效的推荐结果，未能完成模板推荐", retryable=True) from None
+                    time.sleep(interval)
+                    continue
+                if exc.failure == "auth":
+                    break
                 if attempt < retries:
                     time.sleep(interval)
+                    attempt += 1
+                    continue
+                break
         if index < len(agent_api_keys):
             LOG.warning("模型密钥连续失败，切换下一个密钥：序号=%s/%s，原因=%s", index, len(agent_api_keys), last)
     raise ProcessingError("全部模型密钥均调用失败", retryable=False, keys_exhausted=True) from None

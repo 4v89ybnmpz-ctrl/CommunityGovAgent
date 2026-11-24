@@ -8,4 +8,5 @@ __pycache__/
 issue-gov-agent/runtime/
 issue-gov-agent/.consumer-scale
 issue-gov-agent/repository.yml
+docker-compose.override.yml
 *.sqlite3.worker.lock

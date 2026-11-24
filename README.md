@@ -58,4 +58,4 @@ flowchart LR
 | 事件类型 | 仅勾选「Issue 事件」|
 | 启用状态 | 勾选「激活」 |
 
-服务端的容器部署、扩容和验证见 [issue-gov-agent/DEPLOY.md](issue-gov-agent/DEPLOY.md)。
+服务端的容器部署、扩容和验证见 [issue-gov-agent/DEPLOY.md](issue-gov-agent/DEPLOY.md)。接手当前机器上的灰度部署时先读 [issue-gov-agent/HANDOFF.md](issue-gov-agent/HANDOFF.md)。

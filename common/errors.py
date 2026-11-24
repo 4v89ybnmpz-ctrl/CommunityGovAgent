@@ -6,7 +6,7 @@ class ProcessingError(Exception):
 
     def __init__(self, message: str, retryable: bool = True, *,
                  status_code: int | None = None, retry_after: float = 0,
-                 keys_exhausted: bool = False) -> None:
+                 keys_exhausted: bool = False, failure: str = "") -> None:
         """记录经过脱敏的错误原因及重试策略。
 
         Args:
@@ -15,6 +15,9 @@ class ProcessingError(Exception):
             status_code: 平台 HTTP 状态码，用于识别 429 限流。
             retry_after: 服务端要求的等待秒数。
             keys_exhausted: 全部模型密钥都已失败时为 True，任务进入死信队列并不再按任务级重试。
+            failure: 失败类别。network 为连接失败；gateway 为网关页面；
+                auth 为模型鉴权失败；timeout 为模型超时或进程启动失败；
+                invalid_output 为模型结果格式不对。空字符串表示未分类。
         Returns:
             None。
         """
@@ -23,6 +26,7 @@ class ProcessingError(Exception):
         self.status_code = status_code
         self.retry_after = retry_after
         self.keys_exhausted = keys_exhausted
+        self.failure = failure
 
 
 # 现有 Issue 治理代码和测试沿用这个名字，它与 ProcessingError 是同一个类型。

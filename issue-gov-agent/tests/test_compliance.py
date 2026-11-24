@@ -273,9 +273,25 @@ class ComplianceTests(unittest.TestCase):
                 with self.assertRaises(IssueProcessingError) as raised:
                     compliance_recommend.recommend_template("未知", "正文", [TEMPLATE], "agent-key", "model", "https://models.example")
             self.assertTrue(raised.exception.retryable)
+            self.assertEqual(raised.exception.failure, "invalid_output")
             self.assertIn("模型未返回有效的推荐结果", str(raised.exception))
             self.assertNotIn("agent-key", str(raised.exception))
             self.assertNotIn(TOKEN, str(raised.exception))
+
+    def test_auth_failure_is_distinct_from_invalid_output(self):
+        """鉴权失败单独分类，异常文本不包含密钥。"""
+        with patch.object(compliance_recommend.subprocess, "Popen") as popen, patch.object(
+                compliance_recommend.os, "killpg"):
+            process = popen.return_value.__enter__.return_value
+            process.communicate.return_value = ("", "authentication_error: invalid x-api-key " + TOKEN)
+            process.returncode = 1
+            with self.assertRaises(IssueProcessingError) as raised:
+                compliance_recommend.recommend_template(
+                    "未知", "正文", [TEMPLATE], "agent-key", "model", "https://models.example")
+        self.assertEqual(raised.exception.failure, "auth")
+        self.assertIn("模型鉴权失败", str(raised.exception))
+        self.assertNotIn(TOKEN, str(raised.exception))
+        self.assertNotIn("agent-key", str(raised.exception))
 
     def test_model_timeout_kills_process_group_and_removes_temporary_directory(self):
         """验证模型超时后清理进程组和临时配置目录，并抛出可重试错误。

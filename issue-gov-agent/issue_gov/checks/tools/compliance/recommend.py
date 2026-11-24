@@ -14,6 +14,29 @@ from issue_gov.checks.tools.compliance.parse import _fields
 from issue_gov.checks.tools.compliance.rules import RECOMMEND_PROMPT
 
 LLM_TIMEOUT = 120
+_AUTH_MARKERS = (
+    "authentication_error",
+    "authentication error",
+    "invalid api key",
+    "invalid x-api-key",
+    "invalid authentication",
+    "unauthorized",
+    "permission_error",
+    "please run /login",
+    "not logged in",
+    "http 401",
+    "status 401",
+    "401 unauthorized",
+    "403 forbidden",
+    "http 403",
+    "invalid bearer",
+)
+
+
+def _is_auth_failure(detail: str) -> bool:
+    """根据模型进程返回的错误文本判断是否为密钥鉴权失败。"""
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _AUTH_MARKERS)
 
 def recommend_template(
     title: str, body: str, templates: list[dict[str, Any]],
@@ -135,10 +158,10 @@ def recommend_template(
                 "maintainer": maintenance}
     except (OSError, ValueError, TypeError, KeyError, IndexError, subprocess.TimeoutExpired) as exc:
         if isinstance(exc, subprocess.TimeoutExpired):
-            reason = "模型响应超时，未能完成模板推荐。"
-        elif isinstance(exc, OSError):
-            reason = "推荐程序运行失败，未能完成模板推荐。"
-        else:
-            reason = "模型未返回有效的推荐结果，未能完成模板推荐。"
-        raise ProcessingError(reason) from None
+            raise ProcessingError("模型响应超时，未能完成模板推荐。", failure="timeout") from None
+        if isinstance(exc, OSError):
+            raise ProcessingError("推荐程序运行失败，未能完成模板推荐。", failure="timeout") from None
+        if _is_auth_failure(str(exc)):
+            raise ProcessingError("模型鉴权失败，未能完成模板推荐。", failure="auth") from None
+        raise ProcessingError("模型未返回有效的推荐结果，未能完成模板推荐。", failure="invalid_output") from None
 

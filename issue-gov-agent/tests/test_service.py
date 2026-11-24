@@ -144,6 +144,42 @@ class KeyFailoverTests(unittest.TestCase):
         self.assertEqual(pause.call_count, 2)
         self.assertEqual(result["summary"]["recommendation_status"], "recommended")
 
+    def test_auth_failure_switches_key_without_retrying_it(self):
+        calls = []
+
+        def fail(title, body, templates, key, model, base_url):
+            calls.append(key)
+            raise IssueProcessingError("模型鉴权失败，未能完成模板推荐。", failure="auth")
+
+        with patch.object(compliance_recommend, "recommend_template", side_effect=fail), patch.object(
+                compliance_tool.time, "sleep") as pause:
+            with self.assertRaises(IssueProcessingError) as raised:
+                compliance_tool._recommend("未知", "正文", [], "ignored", "model", "https://models.example",
+                                    ("key-a", "key-b"), 2, 10)
+        self.assertTrue(raised.exception.keys_exhausted)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(calls, ["key-a", "key-b"])
+        pause.assert_not_called()
+
+    def test_invalid_output_retries_call_without_exhausting_keys(self):
+        calls = []
+        sleeps = []
+
+        def fail(title, body, templates, key, model, base_url):
+            calls.append(key)
+            raise IssueProcessingError("模型未返回有效的推荐结果，未能完成模板推荐。", failure="invalid_output")
+
+        with patch.object(compliance_recommend, "recommend_template", side_effect=fail), patch.object(
+                compliance_tool.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(IssueProcessingError) as raised:
+                compliance_tool._recommend("未知", "正文", [], "ignored", "model", "https://models.example",
+                                    ("key-a", "key-b"), 2, 10)
+        self.assertFalse(raised.exception.keys_exhausted)
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(calls, ["key-a", "key-a", "key-a"])
+        self.assertEqual(sleeps, [10, 10])
+        self.assertIn("模型未返回有效的推荐结果", str(raised.exception))
+
     def test_configuration_error_does_not_sleep_or_rotate(self):
         with patch.object(compliance_recommend, "recommend_template",
                           side_effect=IssueProcessingError("未配置 LLM_BASE_URL 或 LLM_MODEL")) as recommend, \
