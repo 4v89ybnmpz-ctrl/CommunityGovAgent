@@ -1,15 +1,16 @@
 """PostgreSQL 路径的关键语句回归。SQLite 单测无法暴露方言差异（如 MAX 双参）。
 
 无 PostgreSQL 时整组跳过：设置 PG_TEST_DATABASE_URL，
-例如 postgresql://issue:issue@127.0.0.1:5432/issue_gov_test。
-CI 中由 service 容器提供，本地验证可用 scripts/service compose up -d postgres。
+例如 postgresql://issue:issue@127.0.0.1:54329/issue_gov_test。
+CI 中由 service 容器提供。本地先启动 postgres；连接串里的库不存在且账号可以建库时，这里会创建它。
 """
 
 import os
+from urllib.parse import urlsplit, urlunsplit
 import time
 import unittest
 
-import issue_gov  # 把仓库根目录放进导入路径，后续才能导入 common
+import issue_gov  # noqa: F401  # 把仓库根目录放进导入路径，后续才能导入 common
 from common.errors import IssueProcessingError
 
 TEST_URL = os.environ.get("PG_TEST_DATABASE_URL", "").strip()
@@ -17,6 +18,31 @@ TEST_URL = os.environ.get("PG_TEST_DATABASE_URL", "").strip()
 # SQLite 单测复用同一断言；PG 环境注入连接串后走真实 PostgreSQL。
 if not TEST_URL:
     raise unittest.SkipTest("未设置 PG_TEST_DATABASE_URL，跳过 PostgreSQL 路径测试")
+
+
+def _ensure_database(url: str) -> str:
+    """目标库不存在时，用同一账号在维护库 postgres 里创建它。库已存在时直接返回。"""
+    import re
+
+    import psycopg
+    from psycopg import sql
+
+    try:
+        with psycopg.connect(url, connect_timeout=5):
+            return url
+    except psycopg.OperationalError as exc:
+        if getattr(exc, "sqlstate", None) != "3D000" and "does not exist" not in str(exc):
+            raise
+    parts = urlsplit(url)
+    name = parts.path.lstrip("/").split("?")[0]
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name):
+        raise RuntimeError(f"无法为测试创建数据库：{name}") from None
+    admin = urlunsplit((parts.scheme, parts.netloc, "/postgres", parts.query, ""))
+    with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+        exists = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone()
+        if exists is None:
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    return url
 
 
 def _config(database_url: str):
@@ -36,7 +62,7 @@ class PostgresPathTests(unittest.TestCase):
     def setUpClass(cls):
         from common.pgstore import initialize
         from common.store import connect
-        cls.url = TEST_URL
+        cls.url = _ensure_database(TEST_URL)
         initialize(cls.url)
         cls.config = _config(cls.url)
         cls.connect = staticmethod(lambda: connect(cls.config))
@@ -252,6 +278,73 @@ class PostgresPathTests(unittest.TestCase):
         with self.connect() as db:
             row = db.execute("SELECT state, attempts, next_attempt, owner FROM events").fetchone()
         self.assertEqual((row["state"], row["attempts"], row["owner"]), ("running", 1, "new-owner"))
+
+    def test_null_owner_and_other_holder_cannot_write(self):
+        """持有者为空，或已被覆盖且标识不是当前持有者时，不能写结果或报告。"""
+        import issue_gov.worker as worker
+        self._reset(state="running", attempts=1)
+        config = _config(self.url)
+        written = worker.save_success(config, "pg-evt-1", 1, {"status": "pass", "comment_action": "created"},
+                                      time.time(), owner="intruder")
+        self.assertFalse(written)
+        with self.connect() as db:
+            row = db.execute("SELECT state, result FROM events").fetchone()
+            reports = db.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        self.assertEqual(row["state"], "running")
+        self.assertIsNone(row["result"])
+        self.assertEqual(reports, 0)
+        with self.connect() as db:
+            db.execute("UPDATE events SET state = 'superseded', owner = 'holder'")
+        written = worker.save_success(config, "pg-evt-1", 1, {"status": "pass", "comment_action": "created"},
+                                      time.time(), owner="intruder")
+        self.assertFalse(written)
+        with self.connect() as db:
+            row = db.execute("SELECT state, result, owner FROM events").fetchone()
+            reports = db.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        self.assertEqual((row["state"], row["owner"]), ("superseded", "holder"))
+        self.assertIsNone(row["result"])
+        self.assertEqual(reports, 0)
+
+    def test_current_holder_can_record_superseded_result(self):
+        """原持有者在任务被新通知覆盖后仍可记下结果，但状态保持 superseded。"""
+        import issue_gov.worker as worker
+        self._reset(state="running", attempts=1)
+        with self.connect() as db:
+            db.execute("UPDATE events SET state = 'superseded', owner = 'holder'")
+        config = _config(self.url)
+        written = worker.save_success(config, "pg-evt-1", 1, {"status": "pass", "comment_action": "suppressed"},
+                                      time.time(), owner="holder")
+        self.assertTrue(written)
+        with self.connect() as db:
+            row = db.execute("SELECT state FROM events").fetchone()
+            reports = db.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        self.assertEqual(row["state"], "superseded")
+        self.assertEqual(reports, 1)
+
+    def test_redelivery_takeover_runs_once(self):
+        """回归：多条重投同时看到 running 时，只有换到标识的那一个消费者执行检查。"""
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+        import issue_gov.worker as worker
+        self._reset(state="running", attempts=1)
+        config = _config(self.url)
+        calls = []
+
+        def process(config_, repository, number, *, client, checks=None):
+            time.sleep(0.05)
+            calls.append(number)
+            return {"status": "pass", "comment_action": "suppressed"}
+
+        with patch.object(worker, "_process_issue", side_effect=process):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                actions = list(pool.map(
+                    lambda _: worker.handle_delivery(config, {"event_id": "pg-evt-1"}, True, client=object()),
+                    range(4)))
+        self.assertEqual(sorted(actions), ["ack"] * 4)
+        self.assertEqual(calls, [1], "重投接管后只能有一个消费者执行检查")
+        with self.connect() as db:
+            row = db.execute("SELECT state, attempts FROM events").fetchone()
+        self.assertEqual((row["state"], row["attempts"]), ("completed", 1))
 
 
 if __name__ == "__main__":

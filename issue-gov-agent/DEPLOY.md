@@ -72,11 +72,9 @@ scripts/service compose stop
 
 `scripts/service up` 在配置缺失时只生成文件并退出，不会用空令牌启动。配置写好后再次执行才会构建镜像并启动。
 
-消费者镜像包含 Node.js 22 和 Claude Code `2.1.316`，构建时需要能下载这两个组件。接收镜像不包含它们。Python 依赖按 `issue-gov-agent/requirements.lock` 安装，与 CI 使用同一组版本；更新依赖时同步修改锁文件。更新消费者时重新构建并执行：
+消费者镜像包含 Node.js 22 和 Claude Code `2.1.316`，构建时需要能下载这两个组件。接收镜像不包含它们。Python 依赖按 `issue-gov-agent/requirements.lock` 安装，与 CI 使用同一组版本；更新依赖时同步修改锁文件。
 
-```bash
-scripts/service compose up -d --build --scale consumer=3 consumer
-```
+`scripts/service scale` 把副本数记在 `issue-gov-agent/.consumer-scale`（不提交）。之后的 `scripts/service up` 会带上这个数量，重新构建也不会退回 1。尚未执行过 `scale` 时按 1 个消费者启动。直接执行 `docker compose up` 时仍要自己加上 `--scale`。
 
 RabbitMQ 管理页面默认是 `http://127.0.0.1:15672`（用户和密码与 `RABBITMQ_USER`、`RABBITMQ_PASSWORD` 相同）。死信堆在 `issue.analysis.dlq`。处理完密钥或网络问题后执行 `scripts/service retry`，失败任务会重新进入分析队列，同时清空死信队列中对应上次失败的消息。
 
@@ -107,7 +105,7 @@ cd issue-gov-agent
 .venv/bin/python -m unittest discover -s tests
 ```
 
-PostgreSQL 路径测试默认跳过；本机验证时先启动数据库，再设置连接串（CI 已自动执行）：
+PostgreSQL 路径测试默认跳过；本机验证时先启动数据库，再设置连接串（CI 已自动执行）。账号、口令和端口与 `issue-gov-agent/.env` 里的 `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_PORT` 一致。库名用独立的 `issue_gov_test`，不要指向正在使用的业务库；库不存在且该账号可以建库时，测试会创建它。
 
 ```bash
 scripts/service compose up -d postgres
@@ -128,10 +126,10 @@ python3 scripts/concurrency_check.py
 
 | 现象 | 处理 |
 | --- | --- |
-| `scripts/service up` 提示容器用户无法读取配置 | 按提示 `chown <uid>` 该文件，或导出正确的 `UID` 后重试 |
+| `scripts/service up` 提示容器用户无法读取配置 | 按提示 `chown <uid>` 该文件，或 `CONTAINER_UID=<uid> CONTAINER_GID=<gid> scripts/service up` |
 | `scripts/service up` 提示填写配置 | 编辑 `issue-gov-agent/.env` 和 `repository.yml` 后重试 |
 | `/ready` 持续失败 | `scripts/service compose logs receiver`，确认 Postgres 和 RabbitMQ 健康；数据库暂不可达时接收进程保持运行并每 2 秒重试，`/ready` 返回 `initializing` |
 | 任务停在 `dispatching` | 消费者未运行或队列确认失败；启动消费者后，超过 60 秒会被重新投递 |
 | 任务 `failed` 且 `dead_lettered=1` | 查看 `last_error` 和死信队列，修复密钥或模型配置后执行 `scripts/service retry` |
-| 修改 `.env` 或仓库名单后未生效 | `scripts/service compose up -d --force-recreate receiver consumer` |
+| 修改 `.env` 或仓库名单后未生效 | `scripts/service compose restart receiver consumer`；需要重建镜像时执行 `scripts/service up`，它会保留已记录的消费者副本数 |
 | 只想恢复单机 | 不要设置 `SERVICE_MODE`，继续使用 `manage.py` |

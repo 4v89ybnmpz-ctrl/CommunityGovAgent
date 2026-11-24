@@ -372,6 +372,17 @@ def purge_dead_letters(url: str, topology) -> int:
         return 0
 
 
+def _holder_clause(owner: str | None) -> tuple[str, tuple]:
+    """队列路径只允许当前持有者写回。不传 owner 时是 SQLite 路径，由文件锁保证唯一。
+
+    持有者为空、或标识与当前行不一致时，更新匹配 0 行。已被新通知覆盖的行仍可由原持有者写回结果，
+    状态保持 superseded。
+    """
+    if owner is None:
+        return "", ()
+    return " AND owner = ?", (owner,)
+
+
 def save_success(config: Config, event_id: str, attempt: int, result: dict, now: float,
                  *, owner: str | None = None) -> bool:
     """保存处理结果，并写入报告表。已被新请求覆盖的任务保留 superseded。
@@ -383,14 +394,12 @@ def save_success(config: Config, event_id: str, attempt: int, result: dict, now:
         结果已写入为 True；任务已被其他消费者接管、本次写入被拒绝时为 False。
     """
     payload = json.dumps(result, ensure_ascii=False)
+    guard, extra = _holder_clause(owner)
     with connect(config) as db:
-        # owner 为空表示 SQLite 路径（文件锁已保证唯一）；非空时只有仍是持有者的写入才生效。
-        # 不用 "? IS NULL OR owner = ?" 的写法：psycopg 无法推断绑定为 NULL 的参数类型。
-        guard = " AND (owner = ? OR owner IS NULL OR state = 'superseded')" if owner is not None else ""
         updated = db.execute(f"""UPDATE events SET state = CASE WHEN state='superseded' THEN state ELSE 'completed' END,
                       result = ?, last_error = NULL, updated_at = ?, owner = NULL
                       WHERE event_id = ? AND attempts = ? AND state IN ('running', 'superseded'){guard}""",
-                   (payload, now, event_id, attempt, *((owner,) if owner is not None else ())))
+                   (payload, now, event_id, attempt, *extra))
         if updated.rowcount == 0:
             # 任务已被其他消费者接管，不写报告，避免覆盖接管者的结果。
             return False
@@ -416,8 +425,8 @@ def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessi
                  *, owner: str | None = None) -> tuple[str, float]:
     """记录失败、安排退避或标记最终失败。全部密钥失败时同时标上死信。
 
-    owner 是消费者领取任务时写入的持有者标识；给出时只有仍是持有者的写入才生效，
-    已被接管的任务直接返回其当前状态，不再安排重试或写报告。
+    owner 是消费者领取任务时写入的持有者标识；给出时只有仍是持有者的写入才生效。
+    标识为空、与当前行不一致，或更新落空时返回 taken_over，不再安排重试或写报告。
     """
     mark_dead = bool(exc.keys_exhausted)
     state = "queued" if exc.retryable and not mark_dead and attempt < MAX_ATTEMPTS else "failed"
@@ -428,13 +437,11 @@ def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessi
         current = db.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
         if current is None:
             return "missing", retry_delay
-        # 旧库可能没有 owner 列；没有持有者信息时不做接管校验，沿用原来的写入语义。
+        # 给出持有者时，标识必须与当前行一致。空标识和他人标识都不能写回，已覆盖的行也一样。
         holder = current["owner"] if "owner" in current.keys() else None  # noqa: SIM118
-        if owner is not None and holder not in (owner, None) and current["state"] != "superseded":
-            # 任务已被其他消费者接管，本次失败不属于当前持有者，不覆盖它的状态。
+        if owner is not None and holder != owner:
             return "taken_over", retry_delay
-        # 与 save_success 相同的持有者守卫；不用 "? IS NULL OR owner = ?" 以免 psycopg 无法推断参数类型。
-        guard = " AND (owner = ? OR owner IS NULL OR state = 'superseded')" if owner is not None else ""
+        guard, extra = _holder_clause(owner)
         if exc.status_code == 429:
             # PostgreSQL 的 MAX() 只是聚合函数；跨方言用 CASE 比较取较大值。
             db.execute("""INSERT INTO api_cooldown(name, until) VALUES ('atomgit', ?)
@@ -442,14 +449,15 @@ def save_failure(config: Config, event_id: str, attempt: int, exc: IssueProcessi
                               CASE WHEN excluded.until > api_cooldown.until
                                    THEN excluded.until ELSE api_cooldown.until END""",
                        (now + retry_delay,))
-        db.execute(f"""UPDATE events SET
+        updated = db.execute(f"""UPDATE events SET
                         state = CASE WHEN state='superseded' THEN state ELSE ? END,
                         next_attempt = ?, last_error = ?, updated_at = ?, owner = NULL,
                         dead_lettered = CASE WHEN state='superseded' THEN dead_lettered
                                              WHEN ? = 1 THEN 1 ELSE dead_lettered END
                       WHERE event_id = ? AND attempts = ? AND state IN ('running', 'superseded'){guard}""",
-                   (state, now + retry_delay, str(exc), now, 1 if mark_dead else 0, event_id, attempt,
-                    *((owner,) if owner is not None else ())))
+                   (state, now + retry_delay, str(exc), now, 1 if mark_dead else 0, event_id, attempt, *extra))
+        if owner is not None and updated.rowcount == 0:
+            return "taken_over", retry_delay
         current = db.execute("SELECT state FROM events WHERE event_id=?", (event_id,)).fetchone()[0]
         if current == "failed":
             db.execute("""INSERT INTO reports (event_id, repository, issue_number, status,
@@ -535,10 +543,20 @@ def handle_delivery(config: Config, payload: dict, redelivered: bool, *, client:
             return "ack"
         owner = secrets.token_hex(8)
         if state == "running" and redelivered:
-            # 原持有者失联后接管：换上自己的标识，旧持有者此后的完成写入会被拒绝。
+            # 原持有者失联后接管。比较并交换当前标识，避免两个消费者同时接管后都去执行检查。
+            # 更新落空说明任务已完成、已覆盖或被另一消费者抢走，不再执行检查和发评论。
             attempt = int(row["attempts"])
-            db.execute("UPDATE events SET updated_at=?, owner=? WHERE event_id=? AND state='running'",
-                       (now, owner, event_id))
+            previous = row["owner"] if "owner" in row.keys() else None  # noqa: SIM118
+            if previous is None:
+                updated = db.execute("""UPDATE events SET updated_at=?, owner=?
+                                        WHERE event_id=? AND state='running' AND owner IS NULL""",
+                                     (now, owner, event_id))
+            else:
+                updated = db.execute("""UPDATE events SET updated_at=?, owner=?
+                                        WHERE event_id=? AND state='running' AND owner=?""",
+                                     (now, owner, event_id, previous))
+            if updated.rowcount == 0:
+                return "ack"
         else:
             attempt = int(row["attempts"]) + 1
             updated = db.execute("""UPDATE events SET state='running', attempts=?, updated_at=?, owner=?

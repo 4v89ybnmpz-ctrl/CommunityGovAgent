@@ -11,6 +11,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT/issue-gov-agent/.env"
 REPOSITORY_FILE="$ROOT/issue-gov-agent/repository.yml"
+# scripts/service scale 写入，up 读取。不放进 .env，避免和凭据混在一起。
+SCALE_FILE="$ROOT/issue-gov-agent/.consumer-scale"
 
 # 应用容器按执行本脚本的用户身份运行（见 docker-compose.yml 的 user:）。
 # bash 的 UID 是只读变量，GID 默认未设置，所以用独立的 CONTAINER_UID/GID 传给 Compose；
@@ -21,6 +23,17 @@ export CONTAINER_UID CONTAINER_GID
 
 usage() {
   echo "用法：scripts/service up|status|scale 副本数|retry|compose <docker compose 参数>" >&2
+}
+
+consumer_scale() {
+  local n=1
+  if [[ -f "$SCALE_FILE" ]]; then
+    n="$(tr -cd '0-9' < "$SCALE_FILE" || true)"
+  fi
+  if [[ ! "$n" =~ ^[1-9][0-9]*$ ]]; then
+    n=1
+  fi
+  printf '%s' "$n"
 }
 
 check_readable() {
@@ -84,7 +97,7 @@ case "$cmd" in
       exit 1
     fi
     check_readable "$CONTAINER_UID" "$ENV_FILE" && check_readable "$CONTAINER_UID" "$REPOSITORY_FILE" || exit 1
-    compose up -d --build "$@"
+    compose up -d --build --scale "consumer=$(consumer_scale)" "$@"
     echo "等待接收服务就绪..."
     PORT="$(webhook_port)"
     python3 - "$PORT" <<'PY'
@@ -103,7 +116,7 @@ raise SystemExit(1)
 PY
     compose ps
     echo "接收地址：http://127.0.0.1:${PORT}/webhook"
-    echo "扩容消费者：scripts/service scale 3"
+    echo "消费者副本：$(consumer_scale)。调整：scripts/service scale 3"
     ;;
   status)
     compose ps
@@ -122,7 +135,8 @@ PY
       echo "用法：scripts/service scale 副本数" >&2
       exit 1
     fi
-    compose up -d --scale "consumer=$1" --no-deps
+    compose up -d --scale "consumer=$1" --no-deps consumer
+    printf '%s\n' "$1" > "$SCALE_FILE"
     compose ps consumer
     ;;
   retry)
